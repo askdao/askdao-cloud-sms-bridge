@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service identity -->
+    <key>Label</key>
+    <string>com.askdao.sms-bridge</string>
+
+    <!-- Working directory: .env and the session file are read from here -->
+    <key>WorkingDirectory</key>
+    <string>__INSTALL_DIR__</string>
+
+    <!-- Command: the compiled binary -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__INSTALL_DIR__/bin/sms-bridge</string>
+        <string>serve</string>
+    </array>
+
+    <!-- Auto-start on load (boot/login) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart after a crash or an error exit; a clean stop (launchctl stop) stays stopped -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle restart: wait 10s before restarting -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging: info to bridge.log, warnings and errors to bridge.error.log -->
+    <key>StandardOutPath</key>
+    <string>__INSTALL_DIR__/logs/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>__INSTALL_DIR__/logs/bridge.error.log</string>
+</dict>
+</plist>
