@@ -323,9 +323,8 @@ func TestInboundDetails(t *testing.T) {
 	h, c, sink := readyManager(t)
 	// Sender without "+": normalized. Number only in the conversation's participant list.
 	c.emit(msg("801", groupID, "6", "hello", gmproto.MessageStatusType_INCOMING_COMPLETE))
-	// iPhone replies arrive as plain text without a reply reference: forwarded as is.
-	reply := "Replied to a message:\n/askdao zzBodyB and more"
-	c.emit(msg("802", groupID, "5", reply, gmproto.MessageStatusType_INCOMING_COMPLETE))
+	// iPhone replies arrive as plain text with a leading reply line and no reply reference.
+	c.emit(msg("802", groupID, "5", "Replied to a message:\n/askdao zzBodyB and more", gmproto.MessageStatusType_INCOMING_COMPLETE))
 	// Text with an attachment: the text goes, the attachment does not.
 	c.emit(withMedia(msg("803", groupID, "5", "look at this", gmproto.MessageStatusType_INCOMING_COMPLETE)))
 	// Direct conversation: not a group, no title.
@@ -342,8 +341,13 @@ func TestInboundDetails(t *testing.T) {
 	if got[0].Sender != "+15550000002" {
 		t.Errorf("sender = %q, want +15550000002", got[0].Sender)
 	}
-	if got[1].Content != reply {
-		t.Errorf("reply content changed: %q", got[1].Content)
+	if got[1].Content != "/askdao zzBodyB and more" || !got[1].ReplyFallback {
+		t.Errorf("reply: %q, reply_fallback=%v", got[1].Content, got[1].ReplyFallback)
+	}
+	for _, i := range []int{0, 2, 3, 4} {
+		if got[i].ReplyFallback {
+			t.Errorf("message %s: reply_fallback set without a reply line", got[i].ID)
+		}
 	}
 	if got[2].Content != "look at this" {
 		t.Errorf("content = %q", got[2].Content)
@@ -356,6 +360,51 @@ func TestInboundDetails(t *testing.T) {
 	}
 	if !strings.Contains(h.logs.String(), "attachments not forwarded") {
 		t.Error("the dropped attachment should be logged")
+	}
+	assertNoText(t, h)
+}
+
+// An iPhone reply in an RCS group reaches Android as "Replied to a message:\n<text>".
+// Only that exact leading line is removed, once; anything else is forwarded untouched.
+func TestInboundReplyFallback(t *testing.T) {
+	h, c, sink := readyManager(t)
+	cases := []struct {
+		name, text, want string
+		stripped         bool
+	}{
+		{"leading reply line", "Replied to a message:\n/askdao zzBodyR1", "/askdao zzBodyR1", true},
+		{"only once", "Replied to a message:\nReplied to a message:\n/askdao zzBodyR2", "Replied to a message:\n/askdao zzBodyR2", true},
+		{"in the middle", "/askdao zzBodyR3\nReplied to a message:\nmore", "/askdao zzBodyR3\nReplied to a message:\nmore", false},
+		{"lower case", "replied to a message:\n/askdao zzBodyR4", "replied to a message:\n/askdao zzBodyR4", false},
+		{"upper case", "REPLIED TO A MESSAGE:\n/askdao zzBodyR5", "REPLIED TO A MESSAGE:\n/askdao zzBodyR5", false},
+		{"no colon", "Replied to a message\n/askdao zzBodyR6", "Replied to a message\n/askdao zzBodyR6", false},
+		{"period instead of colon", "Replied to a message.\n/askdao zzBodyR7", "Replied to a message.\n/askdao zzBodyR7", false},
+		{"space instead of newline", "Replied to a message: /askdao zzBodyR8", "Replied to a message: /askdao zzBodyR8", false},
+		{"CRLF", "Replied to a message:\r\n/askdao zzBodyR9", "Replied to a message:\r\n/askdao zzBodyR9", false},
+		{"leading space", " Replied to a message:\n/askdao zzBodyRa", " Replied to a message:\n/askdao zzBodyRa", false},
+	}
+	for i, tc := range cases {
+		id := fmt.Sprintf("11%02d", i)
+		c.emit(msg(id, groupID, "5", tc.text, gmproto.MessageStatusType_INCOMING_COMPLETE))
+		settle(t, c, sink)
+		got := nonMarkers(sink)
+		if len(got) != i+1 || got[i].ID != id {
+			t.Fatalf("%s: not forwarded (%d messages)", tc.name, len(got))
+		}
+		if got[i].Content != tc.want || got[i].ReplyFallback != tc.stripped {
+			t.Errorf("%s: content %q reply_fallback=%v, want %q %v", tc.name, got[i].Content, got[i].ReplyFallback, tc.want, tc.stripped)
+		}
+	}
+
+	// Nothing left after the reply line: no text, dropped like an attachment-only message.
+	before := len(nonMarkers(sink))
+	c.emit(msg("1199", groupID, "5", "Replied to a message:\n", gmproto.MessageStatusType_INCOMING_COMPLETE))
+	settle(t, c, sink)
+	if got := nonMarkers(sink); len(got) != before {
+		t.Fatalf("an empty reply was forwarded: %+v", got[len(got)-1])
+	}
+	if !droppedWith(h.logs.String(), "1199", dropNoText) {
+		t.Error("the empty reply should be logged as dropped with reason no_text")
 	}
 	assertNoText(t, h)
 }

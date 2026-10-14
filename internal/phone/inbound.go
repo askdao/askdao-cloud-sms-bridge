@@ -1,5 +1,6 @@
 // [INPUT]: libgm WrappedMessage, gmproto message statuses and conversations, number.go NormalizeNumber
-// [OUTPUT]: Inbound; inbox (the inbound rules, run inside libgm's callback), idSet, messageText, senderNumber
+// [OUTPUT]: Inbound; inbox (the inbound rules, run inside libgm's callback), idSet, messageText
+//           (strips the iPhone "Replied to a message:" line), senderNumber
 // [POS]: internal/phone's inbound side: manager.go calls inbox.admit in the callback, then its worker
 //        looks up the conversation and hands an Inbound to the consumer (the WebSocket server)
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
@@ -24,6 +25,8 @@ type Inbound struct {
 	Timestamp int64 // unix seconds
 	IsGroup   bool
 	ChatTitle string // the conversation name for groups, "" otherwise
+	// ReplyFallback: Content had a leading "Replied to a message:" line, which was removed.
+	ReplyFallback bool
 }
 
 // Drop reasons, logged with the message id.
@@ -36,7 +39,7 @@ const (
 	dropUnknown    = "unknown_status" // a status outside the known ranges
 	dropStale      = "stale"          // sent before the bridge first connected, though not marked old
 	dropIncomplete = "incomplete"     // still downloading or failed; may arrive again complete
-	dropNoText     = "no_text"        // nothing but attachments, which are not forwarded yet
+	dropNoText     = "no_text"        // no text: attachments only (not forwarded yet), or only the reply line
 )
 
 // staleMargin allows for the phone's clock running slightly behind this machine's.
@@ -103,7 +106,7 @@ func (b *inbox) admit(m *libgm.WrappedMessage) string {
 		return final(dropStale)
 	case !receivedComplete(st):
 		return dropIncomplete
-	case messageText(m.Message) == "":
+	case noText(m.Message):
 		return final(dropNoText)
 	}
 	b.seen.add(id)
@@ -121,16 +124,34 @@ func receivedComplete(st gmproto.MessageStatusType) bool {
 	return false
 }
 
-// messageText joins the text parts of m. iPhone replies arrive as plain text starting with
-// "Replied to a message:" and carry no reply reference; they are forwarded as they are.
-func messageText(m *gmproto.Message) string {
+// replyFallbackPrefix is the line an iPhone puts in front of a reply sent into an RCS group:
+// the Android side gets plain text, with no reply reference. Only this exact English form,
+// as seen on a real phone, is recognised.
+const replyFallbackPrefix = "Replied to a message:\n"
+
+// messageText joins the text parts of m and removes a leading replyFallbackPrefix, once;
+// stripped reports whether it did. A message that was nothing but that line ends up empty.
+func messageText(m *gmproto.Message) (text string, stripped bool) {
 	var parts []string
 	for _, p := range m.GetMessageInfo() {
 		if c, ok := p.GetData().(*gmproto.MessageInfo_MessageContent); ok && c.MessageContent.GetContent() != "" {
 			parts = append(parts, c.MessageContent.GetContent())
 		}
 	}
-	return strings.Join(parts, "\n")
+	return stripReplyFallback(strings.Join(parts, "\n"))
+}
+
+func stripReplyFallback(text string) (string, bool) {
+	if rest, ok := strings.CutPrefix(text, replyFallbackPrefix); ok {
+		return rest, true
+	}
+	return text, false
+}
+
+// noText: no text left once the reply line is removed (attachments only, or only that line).
+func noText(m *gmproto.Message) bool {
+	text, _ := messageText(m)
+	return text == ""
 }
 
 func hasMedia(m *gmproto.Message) bool {

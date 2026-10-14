@@ -318,8 +318,12 @@ status frame; the phone connection is in `state`.
 - `media` is always empty: attachments are not forwarded yet. A message with text and an
   attachment is forwarded with its text; an attachment-only message is not forwarded. Both
   are logged.
-- No reply relation: replies from iPhones arrive as plain text starting with
-  `Replied to a message:` and are forwarded as they are.
+- No reply relation: an iPhone reply in an RCS group arrives as plain text,
+  `Replied to a message:` plus a newline and then the actual text. When the text starts with
+  exactly that line (this English wording, this case and punctuation, followed by `\n`), the
+  bridge removes it once, so a reply that starts `/askdao` still reads as a trigger, and adds
+  `"reply_fallback": true` to the frame; other messages have no such field. A reply with
+  nothing after that line has no text and is dropped (logged).
 
 Only new messages from someone else that were received completely are forwarded. Dropped
 (each logged with its reason and the message id):

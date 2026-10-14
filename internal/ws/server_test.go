@@ -213,6 +213,19 @@ func TestMessageFrame(t *testing.T) {
 	if raw != want {
 		t.Errorf("got  %s\nwant %s", raw, want)
 	}
+	// A reply whose leading "Replied to a message:" line was removed carries reply_fallback.
+	ts.srv.Deliver(phone.Inbound{
+		ID: "102", ChatID: "24", Sender: "+15550000001", Content: "/askdao hi",
+		Timestamp: 1767268800, IsGroup: true, ChatTitle: "Test group", ReplyFallback: true,
+	})
+	_, raw, err = read(t, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = `{"type":"message","id":"102","sender":"+15550000001","chat_id":"24","content":"/askdao hi","timestamp":1767268800,"isGroup":true,"chat_title":"Test group","media":[],"reply_fallback":true}`
+	if raw != want {
+		t.Errorf("got  %s\nwant %s", raw, want)
+	}
 }
 
 func TestCommands(t *testing.T) {

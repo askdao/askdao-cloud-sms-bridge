@@ -22,6 +22,8 @@ type messageFrame struct {
 	IsGroup   bool   `json:"isGroup"`
 	ChatTitle string `json:"chat_title"`
 	Media     []any  `json:"media"` // always empty: attachments are not forwarded yet
+	// ReplyFallback is present (true) only when a leading "Replied to a message:" line was removed.
+	ReplyFallback bool `json:"reply_fallback,omitempty"`
 }
 
 // statusFrame reports the phone connection. "status" is always "connected": it means this
@@ -54,6 +56,7 @@ func encodeMessage(in phone.Inbound) []byte {
 	return mustJSON(messageFrame{
 		Type: "message", ID: in.ID, Sender: in.Sender, ChatID: in.ChatID, Content: in.Content,
 		Timestamp: in.Timestamp, IsGroup: in.IsGroup, ChatTitle: in.ChatTitle, Media: []any{},
+		ReplyFallback: in.ReplyFallback,
 	})
 }
 

@@ -315,13 +315,15 @@ func (m *Manager) deliver(evt *libgm.WrappedMessage) {
 		log.Warn().Msg("inbound dropped: sender number unknown")
 		return
 	}
+	text, replyFallback := messageText(evt.Message)
 	in := Inbound{
-		ID:        evt.GetMessageID(),
-		ChatID:    evt.GetConversationID(),
-		Sender:    sender,
-		Content:   messageText(evt.Message),
-		Timestamp: time.UnixMicro(evt.GetTimestamp()).Unix(),
-		IsGroup:   conv.GetIsGroupChat(),
+		ID:            evt.GetMessageID(),
+		ChatID:        evt.GetConversationID(),
+		Sender:        sender,
+		Content:       text,
+		Timestamp:     time.UnixMicro(evt.GetTimestamp()).Unix(),
+		IsGroup:       conv.GetIsGroupChat(),
+		ReplyFallback: replyFallback,
 	}
 	if in.IsGroup {
 		in.ChatTitle = conv.GetName()
@@ -336,7 +338,7 @@ func (m *Manager) deliver(evt *libgm.WrappedMessage) {
 		log.Warn().Msg("inbound dropped: no consumer")
 		return
 	}
-	log.Info().Bool("group", in.IsGroup).Msg("inbound")
+	log.Info().Bool("group", in.IsGroup).Bool("reply_fallback", in.ReplyFallback).Msg("inbound")
 	fn(in)
 }
 
