@@ -43,3 +43,22 @@ func TestLoadDotEnvBadLineHidesContent(t *testing.T) {
 		t.Errorf("got %v", err)
 	}
 }
+
+func TestValidateServe(t *testing.T) {
+	ok := config{SessionFile: "session.json", Port: "3003", Token: "zzTok"}
+	if err := ok.validateServe(); err != nil {
+		t.Errorf("valid config: %v", err)
+	}
+	noToken := ok
+	noToken.Token = ""
+	if err := noToken.validateServe(); err == nil || !strings.Contains(err.Error(), "BRIDGE_TOKEN") {
+		t.Errorf("empty token: %v", err)
+	}
+	for _, p := range []string{"", "abc", "0", "70000"} {
+		bad := ok
+		bad.Port = p
+		if err := bad.validateServe(); err == nil {
+			t.Errorf("port %q accepted", p)
+		}
+	}
+}

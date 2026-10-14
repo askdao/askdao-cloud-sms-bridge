@@ -12,7 +12,10 @@ It runs on a Mac mini as a launchd service.
 group members ──carrier RCS / MMS──▶ Android phone (Google Messages, the bot's number)
                                           │  Google Messages for web protocol (libgm)
                                           ▼
-                              Mac mini: sms-bridge serve (launchd)
+                              Mac mini: sms-bridge serve (launchd, :3003)
+                                          ▲  WebSocket, same frames as the iMessage bridge
+                                          │  (conductor is the client and connects in)
+                              Cloudflare Tunnel ◀── conductor
 ```
 
 ## Requirements
@@ -48,7 +51,8 @@ group members ──carrier RCS / MMS──▶ Android phone (Google Messages, t
    chmod 600 .env
    ```
 
-   Edit `.env` (see the comments in `.env.example`).
+   Edit `.env` (see the comments in `.env.example`). `BRIDGE_TOKEN` is required: generate it
+   with `openssl rand -hex 32` and give conductor the same value.
 
 4. Pair with the phone (next section), then install the service:
 
@@ -57,6 +61,8 @@ group members ──carrier RCS / MMS──▶ Android phone (Google Messages, t
    ```
 
    The service starts at login and restarts 10 seconds after a crash or an error exit.
+
+5. Expose it to conductor (section "Connect conductor").
 
 ## Pair with the phone
 
@@ -141,6 +147,37 @@ account, or account pairing is off), the phone did not respond (keep Google Mess
 foreground), the wrong emoji was tapped, pairing was cancelled or timed out. Fix it and run
 the same command again; the cookie file stays valid until pairing succeeds.
 
+## Connect conductor
+
+Conductor is the WebSocket client: it connects to the bridge, which listens on
+`BRIDGE_PORT` (3003). On a Mac mini that already runs cloudflared, add a rule for a new
+host name to its config (`~/.cloudflared/config.yml`), above the final catch-all rule:
+
+```yaml
+  - hostname: sms-bridge.example.com
+    service: http://localhost:3003
+```
+
+Then route the name and restart cloudflared:
+
+```bash
+cloudflared tunnel route dns <tunnel name> sms-bridge.example.com
+sudo launchctl kickstart -k system/com.cloudflare.cloudflared
+```
+
+Check locally that the bridge listens and accepts the token:
+
+```bash
+lsof -nP -iTCP:3003 -sTCP:LISTEN
+npx wscat -c ws://localhost:3003
+# then send: {"type":"auth","token":"<BRIDGE_TOKEN>"}
+# the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":""}
+```
+
+Give conductor `wss://sms-bridge.example.com` and the same token. Only one conductor
+connection is kept (see "Protocol"); a test connection like the one above replaces
+conductor's until conductor reconnects, about 5 seconds later.
+
 ## Start and stop
 
 ```bash
@@ -174,6 +211,8 @@ Every status change is one line, for example
 
 ## Status
 
+Conductor receives the status in the `status` frame (see "Protocol").
+
 | state | detail | meaning | what to do |
 |---|---|---|---|
 | `ok` | | connected, the phone responds, the bridge is the phone's active web client | nothing |
@@ -204,6 +243,106 @@ When the state is `logged_out`:
 
 When the state is `browser_inactive` / `another_browser`: find who has Google Messages for
 web open with the bot's account, close it, then restart the service.
+
+## Protocol
+
+JSON text frames over one WebSocket, the same frames as the iMessage bridge plus the
+`status` frame's `state` and `detail`. Identifiers are the phone's own: conversation ids,
+message ids and participant ids are short integer strings local to that phone (they change
+if the phone is reset or replaced).
+
+### Connection
+
+- Conductor connects and sends `{"type": "auth", "token": "<BRIDGE_TOKEN>"}` as its first
+  frame, within 10 seconds. A wrong token, any other first frame, or no frame in time gets
+  `{"type": "error", "error": "Invalid token" | "Not authenticated"}` and a close with code
+  1008.
+- One authenticated connection at a time: a newly authenticated connection replaces the
+  previous one, which is closed with code 4000 ("replaced by a newer connection"). The
+  newest wins because conductor sends queued frames right after `auth` without waiting for
+  a reply; refusing the newcomer would silently lose those frames. While two conductor
+  instances overlap (a redeploy), they take turns about every 5 seconds until the old one
+  stops.
+
+### Bridge → conductor
+
+**Status**, right after a successful `auth` and again on every change:
+
+```json
+{"type": "status", "status": "connected", "state": "phone_offline", "detail": "phone_not_responding"}
+```
+
+`state` and `detail` are the values in "Status". `status` is always `"connected"`: it says
+this WebSocket link is up, which is how conductor already reads the iMessage bridge's
+status frame; the phone connection is in `state`.
+
+**Message**, a new message from someone else:
+
+```json
+{
+  "type": "message",
+  "id": "101",
+  "sender": "+15550000001",
+  "chat_id": "24",
+  "content": "/askdao what changed today?",
+  "timestamp": 1767268800,
+  "isGroup": true,
+  "chat_title": "Group name",
+  "media": []
+}
+```
+
+- `id`: the phone's message id; `chat_id`: the phone's conversation id.
+- `sender`: the sender's number in E.164 (`+1XXXXXXXXXX`). Google does not always include
+  the `+`: a number with `+` or with 11 or more digits gets `+` in front of its digits, a
+  10-digit number gets `+1` (a North American assumption); shorter numbers (short codes)
+  stay bare digits; an email address (possible in MMS groups) is lowercased.
+- `timestamp`: unix seconds. `isGroup` and `chat_title` (the conversation name, groups only)
+  come from the conversation.
+- `media` is always empty: attachments are not forwarded yet. A message with text and an
+  attachment is forwarded with its text; an attachment-only message is not forwarded. Both
+  are logged.
+- No reply relation: replies from iPhones arrive as plain text starting with
+  `Replied to a message:` and are forwarded as they are.
+
+Only new messages from someone else that were received completely are forwarded. Dropped
+(each logged with its reason and the message id):
+
+| what | how the bridge tells |
+|---|---|
+| the bridge's own messages echoed back | outgoing status (1–99), or the tmp id of a message the bridge sent |
+| messages replayed after (re)connecting | libgm's `IsOld` |
+| messages from before the bridge first connected | timestamp earlier than the first connection (10 s margin) |
+| system notices (group created, switched to text, member joined, …) | tombstone status (200–299) |
+| deleted messages | `MESSAGE_DELETED` |
+| messages still downloading or failed | incoming status other than complete / delivered / displayed; forwarded later if they complete |
+| re-sends of a message already handled (the phone re-sends the whole message on every status or reaction change) | message id already decided (the bridge remembers the last 10,000; libgm's own check covers only its last 8 updates) |
+
+libgm calls the bridge synchronously for every event, so the checks above only use memory;
+looking up an unknown conversation from the phone happens afterwards, in order, on a worker.
+If the conversation cannot be found the message is dropped, so a group message is never
+passed on as a direct one.
+
+### Conductor → bridge
+
+```json
+{"type": "send", "to": "24", "text": "Answer text", "reply_to": "101"}
+{"type": "send", "to": "+15550000001", "text": "Direct message to a number"}
+{"type": "react", "to": "24", "message_id": "101", "reaction": "like"}
+```
+
+- `to` is a conversation id (digits) or a phone number starting with `+`. For a number the
+  bridge finds, or creates, the one-to-one conversation with it.
+- `reply_to` is ignored: quoted replies do not show on iPhones in RCS groups and are
+  refused by the phone in MMS groups.
+- `react` with `like` sends 👍, in RCS and SMS/MMS conversations alike. Other reactions are
+  ignored (logged).
+- Everything for the same `to` goes out one at a time, in arrival order: the next starts
+  after the phone has echoed the previous message back (the echo carries the same tmp id),
+  or after 10 seconds without an echo, or after a failure. A `react` waits its turn in the
+  same queue. Different `to` values do not wait for each other. If the phone does not
+  answer at all, libgm gives up on a request after 60 seconds.
+- Failures are logged (without the text); nothing is reported back to conductor.
 
 ## License
 

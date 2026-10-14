@@ -1,6 +1,7 @@
-// [INPUT]: env.go config, internal/logx loggers, internal/session (cookies, session file), internal/phone (Pair, Manager)
+// [INPUT]: env.go config, internal/logx loggers, internal/session (cookies, session file), internal/phone (Pair, Manager),
+//          internal/ws Server
 // [OUTPUT]: the sms-bridge binary: `sms-bridge pair -cookies <file>` and `sms-bridge serve`
-// [POS]: cmd/sms-bridge, the entry point launchd runs (serve) and the operator runs once (pair)
+// [POS]: cmd/sms-bridge, the entry point launchd runs (serve: phone Manager + WebSocket server) and the operator runs once (pair)
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Command sms-bridge relays an Android phone's Google Messages (SMS/RCS) to the AskDAO conductor.
@@ -11,13 +12,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/logx"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/session"
+	"github.com/askdao/askdao-cloud-sms-bridge/internal/ws"
 )
 
 const usage = `usage:
@@ -85,10 +90,17 @@ func runPair(cfg config, args []string) error {
 }
 
 func runServe(cfg config) error {
+	if err := cfg.validateServe(); err != nil {
+		return err
+	}
 	log := logx.New(os.Stdout, os.Stderr)
 	auth, err := session.Load(cfg.SessionFile)
 	if err != nil {
 		return fmt.Errorf("%s: %w", cfg.SessionFile, err)
+	}
+	ln, err := net.Listen("tcp", ":"+cfg.Port)
+	if err != nil {
+		return fmt.Errorf("listening for conductor: %w", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -99,7 +111,26 @@ func runServe(cfg config) error {
 		Log:         log,
 		LibraryLog:  logx.Library(os.Stdout, os.Stderr),
 	})
-	log.Info().Msg("starting")
+	srv := ws.New(cfg.Token, mgr, log)
+	mgr.OnInbound(srv.Deliver)
+	mgr.Tracker().Subscribe(srv.PublishStatus)
+	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := hs.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			stop() // exit with an error so launchd restarts the service
+		}
+	}()
+	log.Info().Str("port", cfg.Port).Msg("starting; conductor connects over WebSocket")
 	mgr.Run(ctx)
-	return nil
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = hs.Shutdown(sctx)
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("WebSocket server stopped: %w", err)
+	default:
+		return nil
+	}
 }

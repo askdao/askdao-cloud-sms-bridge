@@ -3,6 +3,8 @@ package phone
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +33,20 @@ type fakeClient struct {
 	emoji          string
 	startErr       error
 	finishErr      error
+
+	convs        map[string]*gmproto.Conversation // what GetConversation returns
+	getConvGate  chan struct{}                    // when set, GetConversation waits for it
+	getConvCalls int
+	byNumber     map[string]*gmproto.Conversation // what GetOrCreateConversation returns
+	createReqs   []*gmproto.GetOrCreateConversationRequest
+	sendStatus   gmproto.SendMessageResponse_Status
+	sendErr      error
+	autoEcho     bool          // echo each sent message back, like the phone does
+	sendGate     chan struct{} // when set, SendMessage waits for it
+	sent         []*gmproto.SendMessageRequest
+	reactOK      bool
+	reactions    []*gmproto.SendReactionRequest
+	echoSeq      int
 }
 
 func (f *fakeClient) SetEventHandler(h libgm.EventHandler) {
@@ -91,6 +107,75 @@ func (f *fakeClient) FinishGaiaPairing(context.Context, *libgm.PairingSession) (
 	return "mobile/1", f.finishErr
 }
 
+func (f *fakeClient) GetConversation(ctx context.Context, id string) (*gmproto.Conversation, error) {
+	f.mu.Lock()
+	f.getConvCalls++
+	gate := f.getConvGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.convs[id]; c != nil {
+		return c, nil
+	}
+	return nil, errors.New("conversation not found")
+}
+
+func (f *fakeClient) GetOrCreateConversation(_ context.Context, req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createReqs = append(f.createReqs, req)
+	conv := f.byNumber[req.GetNumbers()[0].GetNumber()]
+	if conv == nil {
+		return &gmproto.GetOrCreateConversationResponse{}, nil
+	}
+	return &gmproto.GetOrCreateConversationResponse{Conversation: conv, Status: gmproto.GetOrCreateConversationResponse_SUCCESS}, nil
+}
+
+func (f *fakeClient) SendMessage(ctx context.Context, req *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+	f.mu.Lock()
+	gate := f.sendGate
+	f.sent = append(f.sent, req)
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	status, err, echo := f.sendStatus, f.sendErr, f.autoEcho
+	f.echoSeq++
+	id := fmt.Sprintf("9%03d", f.echoSeq)
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if echo && status == gmproto.SendMessageResponse_SUCCESS {
+		go f.emit(&libgm.WrappedMessage{Message: &gmproto.Message{
+			MessageID: id, ConversationID: req.GetConversationID(), TmpID: req.GetTmpID(),
+			ParticipantID: "1", Timestamp: time.Now().UnixMicro(),
+			MessageStatus: &gmproto.MessageStatus{Status: gmproto.MessageStatusType_OUTGOING_SENDING},
+			MessageInfo:   req.GetMessagePayload().GetMessageInfo(),
+		}})
+	}
+	return &gmproto.SendMessageResponse{Status: status}, nil
+}
+
+func (f *fakeClient) SendReaction(_ context.Context, req *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, req)
+	return &gmproto.SendReactionResponse{Success: f.reactOK}, nil
+}
+
 func (f *fakeClient) emit(evt any) {
 	f.mu.Lock()
 	h := f.handler
@@ -114,7 +199,8 @@ type fakeFactory struct {
 func (ff *fakeFactory) newClient(auth *libgm.AuthData, _ zerolog.Logger) Client {
 	ff.mu.Lock()
 	defer ff.mu.Unlock()
-	c := &fakeClient{auth: auth, email: "bot@example.com"}
+	c := &fakeClient{auth: auth, email: "bot@example.com", sendStatus: gmproto.SendMessageResponse_SUCCESS,
+		reactOK: true, convs: map[string]*gmproto.Conversation{}, byNumber: map[string]*gmproto.Conversation{}}
 	if ff.prepare != nil {
 		ff.prepare(len(ff.clients), c)
 	}
