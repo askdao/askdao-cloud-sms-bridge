@@ -151,12 +151,24 @@ the same command again; the cookie file stays valid until pairing succeeds.
 
 Conductor is the WebSocket client: it connects to the bridge, which listens on
 `BRIDGE_PORT` (3003). On a Mac mini that already runs cloudflared, add a rule for a new
-host name to its config (`~/.cloudflared/config.yml`), above the final catch-all rule:
+host name, above the final catch-all rule, in the config file the running cloudflared
+actually reads:
 
 ```yaml
   - hostname: sms-bridge.example.com
     service: http://localhost:3003
 ```
+
+To find that file, look at the service's arguments:
+
+```bash
+sudo launchctl print system/com.cloudflare.cloudflared | grep -A8 arguments
+```
+
+A `--config <file>` argument names it. Without one, cloudflared searches `~/.cloudflared/`,
+then `/etc/cloudflared/` and `/usr/local/etc/cloudflared/`; for a service installed with
+`sudo cloudflared service install`, `~` is root's home directory, not yours, so editing your
+own `~/.cloudflared/config.yml` may change nothing.
 
 Then route the name and restart cloudflared:
 
@@ -165,7 +177,8 @@ cloudflared tunnel route dns <tunnel name> sms-bridge.example.com
 sudo launchctl kickstart -k system/com.cloudflare.cloudflared
 ```
 
-Check locally that the bridge listens and accepts the token:
+Before giving the address to conductor, check locally that the bridge listens and accepts
+the token:
 
 ```bash
 lsof -nP -iTCP:3003 -sTCP:LISTEN
@@ -174,9 +187,12 @@ npx wscat -c ws://localhost:3003
 # the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":""}
 ```
 
-Give conductor `wss://sms-bridge.example.com` and the same token. Only one conductor
-connection is kept (see "Protocol"); a test connection like the one above replaces
-conductor's until conductor reconnects, about 5 seconds later.
+Only one conductor connection is kept (see "Protocol"), so a test connection like this one
+replaces conductor's. Once conductor is connected, do not test this way: until conductor
+reconnects (about 5 seconds), new messages go to the test session and conductor never
+sees them.
+
+Give conductor `wss://sms-bridge.example.com` and the same token.
 
 ## Start and stop
 
