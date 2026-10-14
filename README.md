@@ -324,6 +324,16 @@ status frame; the phone connection is in `state`.
   bridge removes it once, so a reply that starts `/askdao` still reads as a trigger, and adds
   `"reply_fallback": true` to the frame; other messages have no such field. A reply with
   nothing after that line has no text and is dropped (logged).
+- A reaction (tapback) from an iPhone can also arrive as plain text, such as
+  `Loved “…”` (often after the reply line above). When the whole text, after that line is
+  removed, is one of the iOS English forms below, the message is dropped and logged as
+  `tapback_fallback`: `<verb> “…”` with the verb `Loved`, `Liked`, `Disliked`, `Laughed at`,
+  `Emphasized` or `Questioned`; `Removed a heart / a like / a dislike / a laugh /
+  an exclamation / a question mark from “…”`; `Reacted <emoji> to “…”`;
+  `Removed a <emoji> from “…”`; and, for attachments, the six verbs followed by `an image`,
+  `a photo`, `a movie` or `an attachment`. Only a whole-text match counts, with curly quotes
+  and this exact case; straight quotes, extra text before or after, or a lower-case first
+  letter make it a normal message.
 
 Only new messages from someone else that were received completely are forwarded. Dropped
 (each logged with its reason and the message id):
@@ -336,6 +346,7 @@ Only new messages from someone else that were received completely are forwarded.
 | system notices (group created, switched to text, member joined, …) | tombstone status (200–299) |
 | deleted messages | `MESSAGE_DELETED` |
 | messages still downloading or failed | incoming status other than complete / delivered / displayed; forwarded later if they complete |
+| iPhone reactions that arrived as text | the whole text (after the reply line is removed) is an iOS reaction form, e.g. `Loved “…”` |
 | re-sends of a message already handled (the phone re-sends the whole message on every status or reaction change) | message id already decided (the bridge remembers the last 10,000; libgm's own check covers only its last 8 updates) |
 
 libgm calls the bridge synchronously for every event, so the checks above only use memory;

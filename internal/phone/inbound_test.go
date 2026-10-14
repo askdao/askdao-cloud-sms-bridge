@@ -409,6 +409,97 @@ func TestInboundReplyFallback(t *testing.T) {
 	assertNoText(t, h)
 }
 
+var tapbackVerbs = []string{"Loved", "Liked", "Disliked", "Laughed at", "Emphasized", "Questioned"}
+
+// tapbackTexts are reactions as iOS sends them in plain text, one of each form.
+func tapbackTexts() []string {
+	texts := []string{
+		"Removed a heart from “zzBodyQ”",
+		"Removed a like from “zzBodyQ”",
+		"Removed a dislike from “zzBodyQ”",
+		"Removed a laugh from “zzBodyQ”",
+		"Removed an exclamation from “zzBodyQ”",
+		"Removed a question mark from “zzBodyQ”",
+		"Reacted 🙏 to “zzBodyQ”",
+		"Reacted 👍🏽 to “zzBodyQ”",
+		"Removed a 🙏 from “zzBodyQ”",
+		"Loved “[test] group message from the bridge”",
+		"Loved “an answer with “quotes” inside”", // bot answers often contain curly quotes
+		"Loved “two\nlines”",
+	}
+	for _, v := range tapbackVerbs {
+		texts = append(texts, v+" “zzBodyQ”")
+		for _, obj := range []string{"an image", "a photo", "a movie", "an attachment"} {
+			texts = append(texts, v+" "+obj)
+		}
+	}
+	return texts
+}
+
+func TestIsTapbackFallback(t *testing.T) {
+	for _, text := range tapbackTexts() {
+		if !isTapbackFallback(text) {
+			t.Errorf("not recognised: %q", text)
+		}
+	}
+	for _, text := range []string{
+		`Loved "zzBodyQ"`,              // straight quotes
+		"I Loved “zzBodyQ”",            // inside a sentence
+		"Loved “zzBodyQ” so much",      // more text after it
+		"loved “zzBodyQ”",              // lower case
+		"Loved “zzBodyQ”\nand more",    // another line after it
+		"Loved “zzBodyQ",               // no closing quote
+		"Loved an image of a cat",      // more text after it
+		"Liked a picture",              // not one of the four objects
+		"Reacted to “zzBodyQ”",         // no emoji
+		"Removed a heart from zzBodyQ", // no quotes
+		"Loved",
+		"",
+	} {
+		if isTapbackFallback(text) {
+			t.Errorf("a normal message taken for a reaction: %q", text)
+		}
+	}
+}
+
+// iOS reactions that arrive as text (with or without the reply line) are not questions:
+// dropped, logged as tapback_fallback. Near misses are forwarded as normal messages.
+func TestInboundTapbackFallback(t *testing.T) {
+	h, c, sink := readyManager(t)
+	var dropped []string
+	for _, text := range tapbackTexts() {
+		dropped = append(dropped, text, replyFallbackPrefix+text)
+	}
+	for i, text := range dropped {
+		id := fmt.Sprintf("12%03d", i)
+		c.emit(msg(id, dmID, "8", text, gmproto.MessageStatusType_INCOMING_COMPLETE))
+		settle(t, c, sink)
+		if got := nonMarkers(sink); len(got) != 0 {
+			t.Fatalf("forwarded a reaction: %q", got[0].Content)
+		}
+		if !droppedWith(h.logs.String(), id, dropTapback) {
+			t.Errorf("no tapback_fallback log line for %q", text)
+		}
+	}
+	forwarded := []struct{ text, want string }{
+		{`Loved "zzBodyQ"`, `Loved "zzBodyQ"`},
+		{"I Loved “zzBodyQ”", "I Loved “zzBodyQ”"},
+		{"Loved “zzBodyQ” so much", "Loved “zzBodyQ” so much"},
+		{"loved “zzBodyQ”", "loved “zzBodyQ”"},
+		{replyFallbackPrefix + `Loved "zzBodyQ"`, `Loved "zzBodyQ"`},
+	}
+	for i, tc := range forwarded {
+		id := fmt.Sprintf("13%03d", i)
+		c.emit(msg(id, dmID, "8", tc.text, gmproto.MessageStatusType_INCOMING_COMPLETE))
+		settle(t, c, sink)
+		got := nonMarkers(sink)
+		if len(got) != i+1 || got[i].Content != tc.want {
+			t.Fatalf("%q: not forwarded as %q (got %d messages)", tc.text, tc.want, len(got))
+		}
+	}
+	assertNoText(t, h)
+}
+
 // Without the conversation the bridge cannot tell a group from a direct message: drop it.
 func TestInboundUnknownConversationIsDropped(t *testing.T) {
 	h, c, sink := readyManager(t)

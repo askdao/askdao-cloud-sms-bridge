@@ -1,6 +1,6 @@
 // [INPUT]: libgm WrappedMessage, gmproto message statuses and conversations, number.go NormalizeNumber
 // [OUTPUT]: Inbound; inbox (the inbound rules, run inside libgm's callback), idSet, messageText
-//           (strips the iPhone "Replied to a message:" line), senderNumber
+//           (strips the iPhone "Replied to a message:" line), isTapbackFallback, senderNumber
 // [POS]: internal/phone's inbound side: manager.go calls inbox.admit in the callback, then its worker
 //        looks up the conversation and hands an Inbound to the consumer (the WebSocket server)
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
@@ -8,6 +8,7 @@
 package phone
 
 import (
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -31,15 +32,16 @@ type Inbound struct {
 
 // Drop reasons, logged with the message id.
 const (
-	dropDuplicate  = "duplicate"      // already handled: a re-send after a status or reaction change
-	dropOld        = "old"            // libgm's IsOld: replayed after (re)connecting
-	dropOwn        = "own"            // the bridge's own message echoed back
-	dropSystem     = "system"         // a tombstone: group created, protocol switched, member joined...
-	dropDeleted    = "deleted"        // MESSAGE_DELETED
-	dropUnknown    = "unknown_status" // a status outside the known ranges
-	dropStale      = "stale"          // sent before the bridge first connected, though not marked old
-	dropIncomplete = "incomplete"     // still downloading or failed; may arrive again complete
-	dropNoText     = "no_text"        // no text: attachments only (not forwarded yet), or only the reply line
+	dropDuplicate  = "duplicate"        // already handled: a re-send after a status or reaction change
+	dropOld        = "old"              // libgm's IsOld: replayed after (re)connecting
+	dropOwn        = "own"              // the bridge's own message echoed back
+	dropSystem     = "system"           // a tombstone: group created, protocol switched, member joined...
+	dropDeleted    = "deleted"          // MESSAGE_DELETED
+	dropUnknown    = "unknown_status"   // a status outside the known ranges
+	dropStale      = "stale"            // sent before the bridge first connected, though not marked old
+	dropIncomplete = "incomplete"       // still downloading or failed; may arrive again complete
+	dropNoText     = "no_text"          // no text: attachments only (not forwarded yet), or only the reply line
+	dropTapback    = "tapback_fallback" // an iPhone reaction that arrived as text, e.g. Loved “…”
 )
 
 // staleMargin allows for the phone's clock running slightly behind this machine's.
@@ -106,8 +108,13 @@ func (b *inbox) admit(m *libgm.WrappedMessage) string {
 		return final(dropStale)
 	case !receivedComplete(st):
 		return dropIncomplete
-	case noText(m.Message):
+	}
+	text, _ := messageText(m.Message)
+	switch {
+	case text == "": // attachments only, or nothing after the reply line
 		return final(dropNoText)
+	case isTapbackFallback(text):
+		return final(dropTapback)
 	}
 	b.seen.add(id)
 	return ""
@@ -132,13 +139,18 @@ const replyFallbackPrefix = "Replied to a message:\n"
 // messageText joins the text parts of m and removes a leading replyFallbackPrefix, once;
 // stripped reports whether it did. A message that was nothing but that line ends up empty.
 func messageText(m *gmproto.Message) (text string, stripped bool) {
+	return stripReplyFallback(joinedText(m))
+}
+
+// joinedText joins the text parts of m as they arrived.
+func joinedText(m *gmproto.Message) string {
 	var parts []string
 	for _, p := range m.GetMessageInfo() {
 		if c, ok := p.GetData().(*gmproto.MessageInfo_MessageContent); ok && c.MessageContent.GetContent() != "" {
 			parts = append(parts, c.MessageContent.GetContent())
 		}
 	}
-	return stripReplyFallback(strings.Join(parts, "\n"))
+	return strings.Join(parts, "\n")
 }
 
 func stripReplyFallback(text string) (string, bool) {
@@ -148,10 +160,23 @@ func stripReplyFallback(text string) (string, bool) {
 	return text, false
 }
 
-// noText: no text left once the reply line is removed (attachments only, or only that line).
-func noText(m *gmproto.Message) bool {
-	text, _ := messageText(m)
-	return text == ""
+// tapbackFallback matches, as a whole text, the plain-text form iOS uses for a reaction
+// (tapback) when the reaction itself cannot be delivered, as seen in RCS groups:
+// "Loved “…”", "Removed a heart from “…”", "Reacted 🙏 to “…”", "Liked an image", ...
+// English wording, curly quotes, exact case. The quoted part is any text, the emoji is any
+// run of non-space characters. Anything that does not match as a whole is a normal message.
+var tapbackFallback = regexp.MustCompile(`(?s)^(?:` +
+	`(?:Loved|Liked|Disliked|Laughed at|Emphasized|Questioned) “.*”` +
+	`|Removed (?:a heart|a like|a dislike|a laugh|an exclamation|a question mark) from “.*”` +
+	`|Reacted \S+ to “.*”` +
+	`|Removed a \S+ from “.*”` +
+	`|(?:Loved|Liked|Disliked|Laughed at|Emphasized|Questioned) (?:an image|a photo|a movie|an attachment)` +
+	`)$`)
+
+// isTapbackFallback reports whether text (after the reply line is removed) is a reaction
+// that iOS sent as text. Such messages are not questions and are not forwarded.
+func isTapbackFallback(text string) bool {
+	return tapbackFallback.MatchString(text)
 }
 
 func hasMedia(m *gmproto.Message) bool {
