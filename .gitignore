@@ -1,0 +1,9 @@
+# Secrets and live logins: never commit
+.env
+session.json*
+/cookies.txt
+/cookies.json
+
+# Build output and runtime logs
+/bin/
+/logs/
