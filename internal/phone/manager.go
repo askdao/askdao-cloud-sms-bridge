@@ -1,7 +1,9 @@
-// [INPUT]: client.go Client/NewClientFunc, state.go Tracker, internal/session Save, libgm events and gmproto alerts
-// [OUTPUT]: Manager (NewManager, Run, Tracker), ManagerConfig
+// [INPUT]: client.go Client/NewClientFunc, state.go Tracker, inbound.go inbox, outbound.go outbox,
+//          internal/session Save, libgm events and gmproto alerts / messages / conversations / settings
+// [OUTPUT]: Manager (NewManager, Run, Tracker, OnInbound; Send / React in outbound.go), ManagerConfig
 // [POS]: internal/phone's connection owner: connects with the saved session, turns libgm events into Tracker
-//        changes, saves the session, reconnects after non-credential failures, never takes the phone back
+//        changes and admitted inbound messages, caches conversations and SIMs, saves the session,
+//        reconnects after non-credential failures, never takes the phone back
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 package phone
@@ -43,9 +45,24 @@ type Manager struct {
 	// test hooks
 	backoff       func(attempt int) time.Duration
 	activateAfter time.Duration
+	echoWait      time.Duration // how long a send waits for its echo before the next one goes
+	lookupTimeout time.Duration // conversation lookups from the phone
 
-	mu  sync.Mutex
-	cli Client
+	ctx    context.Context // ends when Run ends; outbound jobs use it
+	cancel context.CancelFunc
+
+	mu        sync.Mutex
+	cli       Client
+	onInbound func(Inbound)
+
+	inbox  *inbox
+	inq    chan *libgm.WrappedMessage // admitted messages for the inbound worker
+	out    *outbox
+	echoMu sync.Mutex
+	echoes map[string]chan struct{} // tmp id -> closed when the phone echoes it
+	convMu sync.Mutex
+	convs  map[string]*gmproto.Conversation
+	sims   []*gmproto.SIMCard
 
 	saveMu      sync.Mutex
 	stop        chan struct{} // logged out: stop using the client
@@ -56,6 +73,7 @@ type Manager struct {
 
 // NewManager prepares a Manager; Run starts it.
 func NewManager(cfg ManagerConfig) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		auth:          cfg.Auth,
 		sessionPath:   cfg.SessionPath,
@@ -65,6 +83,15 @@ func NewManager(cfg ManagerConfig) *Manager {
 		state:         NewTracker(cfg.Log),
 		backoff:       reconnectBackoff,
 		activateAfter: 7 * time.Second,
+		echoWait:      10 * time.Second,
+		lookupTimeout: 15 * time.Second,
+		ctx:           ctx,
+		cancel:        cancel,
+		inbox:         newInbox(),
+		inq:           make(chan *libgm.WrappedMessage, 1024),
+		out:           newOutbox(),
+		echoes:        map[string]chan struct{}{},
+		convs:         map[string]*gmproto.Conversation{},
 		stop:          make(chan struct{}),
 		reconnect:     make(chan struct{}, 1),
 	}
@@ -73,6 +100,13 @@ func NewManager(cfg ManagerConfig) *Manager {
 // Tracker exposes the status for subscribers.
 func (m *Manager) Tracker() *Tracker { return m.state }
 
+// OnInbound sets the consumer of new inbound messages. It is called from one goroutine, in order.
+func (m *Manager) OnInbound(fn func(Inbound)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onInbound = fn
+}
+
 // errLoggedOut is returned by connectOnce when the session can no longer be used.
 var errLoggedOut = errors.New("logged out")
 
@@ -80,6 +114,7 @@ var errLoggedOut = errors.New("logged out")
 // After logged_out it stays idle (the process keeps reporting the state) until ctx ends.
 func (m *Manager) Run(ctx context.Context) {
 	defer m.shutdown()
+	go m.inboundWorker()
 	attempt := 0
 	for {
 		err := m.connectOnce(ctx)
@@ -155,6 +190,7 @@ func (m *Manager) connectOnce(ctx context.Context) error {
 		}
 		return err
 	}
+	m.inbox.startCutoff(time.Now())
 	m.log.Info().Msg("connected, waiting for the phone")
 	return nil
 }
@@ -221,7 +257,130 @@ func (m *Manager) handleEvent(cli Client, raw any) {
 		m.activateTry.Do(func() { go m.retryActivation(cli) })
 	case *events.NoDataReceived:
 		m.log.Info().Msg("no data from the phone for a while, libgm asked for updates")
+	case *gmproto.Conversation:
+		m.cacheConversation(evt)
+	case *gmproto.Settings:
+		m.convMu.Lock()
+		m.sims = evt.GetSIMCards()
+		m.convMu.Unlock()
+	case *libgm.WrappedMessage:
+		m.handleMessage(evt)
 	}
+}
+
+// handleMessage runs in libgm's callback: memory-only checks, then a hand-off to the worker.
+func (m *Manager) handleMessage(evt *libgm.WrappedMessage) {
+	if tmp := evt.GetTmpID(); tmp != "" {
+		m.echoed(tmp)
+	}
+	log := m.log.With().Str("message_id", evt.GetMessageID()).Str("conversation_id", evt.GetConversationID()).Logger()
+	if reason := m.inbox.admit(evt); reason != "" {
+		if reason != dropDuplicate {
+			log.Info().Str("reason", reason).Str("status", evt.GetMessageStatus().GetStatus().String()).Msg("inbound dropped")
+		}
+		if reason == dropNoText && hasMedia(evt.Message) {
+			log.Info().Msg("attachment-only message not forwarded (attachments are not supported yet)")
+		}
+		return
+	}
+	select {
+	case m.inq <- evt:
+	default:
+		log.Error().Msg("inbound dropped: queue full")
+	}
+}
+
+// inboundWorker turns admitted messages into Inbound, in arrival order. It may ask the phone
+// for a conversation it has not seen, which the callback must not do.
+func (m *Manager) inboundWorker() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case evt := <-m.inq:
+			m.deliver(evt)
+		}
+	}
+}
+
+func (m *Manager) deliver(evt *libgm.WrappedMessage) {
+	log := m.log.With().Str("message_id", evt.GetMessageID()).Str("conversation_id", evt.GetConversationID()).Logger()
+	conv, err := m.conversation(m.ctx, evt.GetConversationID())
+	if err != nil { // without it a group message could pass for a direct one
+		log.Warn().Err(err).Msg("inbound dropped: conversation unknown")
+		return
+	}
+	sender := NormalizeNumber(senderNumber(evt.Message, conv))
+	if sender == "" {
+		log.Warn().Msg("inbound dropped: sender number unknown")
+		return
+	}
+	text, replyFallback := messageText(evt.Message)
+	in := Inbound{
+		ID:            evt.GetMessageID(),
+		ChatID:        evt.GetConversationID(),
+		Sender:        sender,
+		Content:       text,
+		Timestamp:     time.UnixMicro(evt.GetTimestamp()).Unix(),
+		IsGroup:       conv.GetIsGroupChat(),
+		ReplyFallback: replyFallback,
+	}
+	if in.IsGroup {
+		in.ChatTitle = conv.GetName()
+	}
+	if hasMedia(evt.Message) {
+		log.Info().Msg("attachments not forwarded (not supported yet), text forwarded")
+	}
+	m.mu.Lock()
+	fn := m.onInbound
+	m.mu.Unlock()
+	if fn == nil {
+		log.Warn().Msg("inbound dropped: no consumer")
+		return
+	}
+	log.Info().Bool("group", in.IsGroup).Bool("reply_fallback", in.ReplyFallback).Msg("inbound")
+	fn(in)
+}
+
+// conversation returns the cached conversation, asking the phone on a miss.
+func (m *Manager) conversation(ctx context.Context, id string) (*gmproto.Conversation, error) {
+	m.convMu.Lock()
+	conv := m.convs[id]
+	m.convMu.Unlock()
+	if conv != nil {
+		return conv, nil
+	}
+	cli := m.client()
+	if cli == nil {
+		return nil, errNotConnected
+	}
+	ctx, cancel := context.WithTimeout(ctx, m.lookupTimeout)
+	defer cancel()
+	conv, err := cli.GetConversation(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if conv.GetConversationID() == "" {
+		return nil, errors.New("the phone returned no conversation")
+	}
+	m.cacheConversation(conv)
+	return conv, nil
+}
+
+func (m *Manager) cacheConversation(conv *gmproto.Conversation) {
+	m.convMu.Lock()
+	defer m.convMu.Unlock()
+	m.convs[conv.GetConversationID()] = conv
+}
+
+// client returns the current client, nil while there is none or after logged_out.
+func (m *Manager) client() Client {
+	if m.state.Status().State == StateLoggedOut {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cli
 }
 
 func (m *Manager) handleAlert(t gmproto.AlertType) {
@@ -290,6 +449,7 @@ func (m *Manager) saveSession() {
 }
 
 func (m *Manager) shutdown() {
+	m.cancel()
 	m.saveSession()
 	m.dropClient()
 	m.log.Info().Msg("stopped")

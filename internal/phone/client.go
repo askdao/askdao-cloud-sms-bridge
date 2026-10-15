@@ -1,10 +1,10 @@
-// [INPUT]: go.mau.fi/mautrix-gmessages/pkg/libgm Client, go.mau.fi/util/exhttp
+// [INPUT]: go.mau.fi/mautrix-gmessages/pkg/libgm Client and gmproto, go.mau.fi/util/exhttp
 // [OUTPUT]: Client (the libgm subset the bridge uses), NewClientFunc, NewLibgmClient
-// [POS]: internal/phone's seam to libgm; manager.go and pair.go only talk to Client, tests supply a fake
+// [POS]: internal/phone's seam to libgm; manager.go, pair.go and outbound.go only talk to Client, tests supply a fake
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Package phone drives Google Messages through libgm on behalf of the paired Android phone:
-// pairing, the connection and its status.
+// pairing, the connection and its status, inbound messages and outbound sends.
 package phone
 
 import (
@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/util/exhttp"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
 // Client is the subset of *libgm.Client the bridge uses. libgm calls the event handler
@@ -29,6 +30,12 @@ type Client interface {
 	SetActiveSession(ctx context.Context) error
 	StartGaiaPairing(ctx, bgCtx context.Context) (string, *libgm.PairingSession, error)
 	FinishGaiaPairing(ctx context.Context, ps *libgm.PairingSession) (string, error)
+	GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error)
+	GetOrCreateConversation(ctx context.Context, req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error)
+	// SendMessage returns once the phone accepted the message; the real message id only
+	// arrives later, in the echoed message event carrying the same tmp id.
+	SendMessage(ctx context.Context, req *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+	SendReaction(ctx context.Context, req *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error)
 }
 
 // NewClientFunc builds a Client around auth.

@@ -1,5 +1,5 @@
 // [INPUT]: os environment, an optional .env file in the working directory
-// [OUTPUT]: loadDotEnv, config, loadConfig
+// [OUTPUT]: loadDotEnv, config, loadConfig, config.validateServe
 // [POS]: cmd/sms-bridge's configuration reader; main.go calls loadDotEnv then loadConfig
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -50,10 +51,27 @@ func loadDotEnv(path string) error {
 
 type config struct {
 	SessionFile string
+	Port        string // WebSocket port conductor connects to
+	Token       string // shared token conductor sends in its auth frame
 }
 
 func loadConfig() config {
-	return config{SessionFile: envOr("BRIDGE_SESSION_FILE", "session.json")}
+	return config{
+		SessionFile: envOr("BRIDGE_SESSION_FILE", "session.json"),
+		Port:        envOr("BRIDGE_PORT", "3003"),
+		Token:       os.Getenv("BRIDGE_TOKEN"),
+	}
+}
+
+// validateServe checks the settings serve needs; pair needs none of them.
+func (c config) validateServe() error {
+	if c.Token == "" {
+		return errors.New("BRIDGE_TOKEN is empty; set it in .env (conductor sends the same token)")
+	}
+	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("BRIDGE_PORT must be a port number, got %q", c.Port)
+	}
+	return nil
 }
 
 func envOr(key, def string) string {

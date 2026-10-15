@@ -3,10 +3,12 @@ module github.com/askdao/askdao-cloud-sms-bridge
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/google/uuid v1.6.0
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/mautrix-gmessages v0.2609.0
 	go.mau.fi/util v0.10.1
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -17,5 +19,4 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 )
