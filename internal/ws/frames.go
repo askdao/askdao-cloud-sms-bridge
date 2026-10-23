@@ -1,6 +1,6 @@
 // [INPUT]: internal/phone Inbound and Status
-// [OUTPUT]: messageFrame, statusFrame, errorFrame, command (the JSON shapes on the wire)
-// [POS]: internal/ws's wire format, the iMessage bridge's frames plus the status frame; server.go encodes and decodes these
+// [OUTPUT]: messageFrame, statusFrame (with features), errorFrame, command (the JSON shapes on the wire, send_image included)
+// [POS]: internal/ws's wire format, the iMessage bridge's frames plus the status frame and send_image; server.go encodes and decodes these
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 package ws
@@ -28,20 +28,25 @@ type messageFrame struct {
 
 // statusFrame reports the phone connection. "status" is always "connected": it means this
 // WebSocket link is up, as in the iMessage bridge's status frame, which conductor reads that
-// way. The phone connection is in "state" and "detail".
+// way. The phone connection is in "state" and "detail". "features" lists the optional frames
+// this bridge accepts; conductor sends send_image only to a bridge that lists it.
 type statusFrame struct {
-	Type   string `json:"type"` // "status"
-	Status string `json:"status"`
-	State  string `json:"state"`
-	Detail string `json:"detail"`
+	Type     string   `json:"type"` // "status"
+	Status   string   `json:"status"`
+	State    string   `json:"state"`
+	Detail   string   `json:"detail"`
+	Features []string `json:"features"`
 }
+
+// features is what every status frame advertises.
+var features = []string{"send_image"}
 
 type errorFrame struct {
 	Type  string `json:"type"` // "error"
 	Error string `json:"error"`
 }
 
-// command is any frame conductor sends: auth, send or react.
+// command is any frame conductor sends: auth, send, react or send_image.
 type command struct {
 	Type      string `json:"type"`
 	Token     string `json:"token"`
@@ -50,6 +55,12 @@ type command struct {
 	ReplyTo   string `json:"reply_to"` // accepted and ignored: no quoted replies on this channel
 	MessageID string `json:"message_id"`
 	Reaction  string `json:"reaction"`
+	// send_image
+	HTML     string   `json:"html"`
+	Width    int      `json:"width"`
+	Filename string   `json:"filename"`
+	Caption  string   `json:"caption"`
+	Fallback []string `json:"fallback"`
 }
 
 func encodeMessage(in phone.Inbound) []byte {
@@ -61,7 +72,7 @@ func encodeMessage(in phone.Inbound) []byte {
 }
 
 func encodeStatus(st phone.Status) []byte {
-	return mustJSON(statusFrame{Type: "status", Status: "connected", State: string(st.State), Detail: st.Detail})
+	return mustJSON(statusFrame{Type: "status", Status: "connected", State: string(st.State), Detail: st.Detail, Features: features})
 }
 
 func encodeError(msg string) []byte {
@@ -71,7 +82,7 @@ func encodeError(msg string) []byte {
 func mustJSON(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
-		panic(err) // only fixed struct types of strings, numbers and bools are encoded
+		panic(err) // only fixed struct types of strings, string lists, numbers and bools are encoded
 	}
 	return b
 }

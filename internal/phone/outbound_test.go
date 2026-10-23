@@ -1,7 +1,11 @@
 package phone
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -199,4 +203,279 @@ func TestReactWaitsBehindEarlierSend(t *testing.T) {
 		c.get(func(f *fakeClient) { n = len(f.reactions) })
 		return n == 1
 	})
+}
+
+// fakeRenderer stands in for render.Renderer.Render.
+type fakeRenderer struct {
+	mu    sync.Mutex
+	calls []string      // "width|html"
+	gate  chan struct{} // when set, render waits for it
+	png   []byte
+	err   error
+}
+
+func (r *fakeRenderer) render(ctx context.Context, html string, width int) ([]byte, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, fmt.Sprintf("%d|%s", width, html))
+	gate := r.gate
+	r.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return r.png, r.err
+}
+
+func (r *fakeRenderer) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+var fakePNG = []byte("\x89PNG\r\n\x1a\nzzPixels")
+
+func imageManager(t *testing.T) (*harness, *fakeClient, *fakeRenderer) {
+	t.Helper()
+	h, c, _ := readyManager(t)
+	r := &fakeRenderer{png: fakePNG}
+	h.mgr.render = r.render
+	return h, c, r
+}
+
+func report() Image {
+	return Image{
+		HTML: "<!doctype html><p>zzBodyHTML</p>", Width: 1080, Filename: "report.png",
+		Caption: "zzBodyCaption", Fallback: []string{"zzBodyFallback1", "", "zzBodyFallback2"},
+	}
+}
+
+// sentParts describes every sent request: "image:<media id>" for a media part, the text otherwise.
+func sentParts(c *fakeClient) []string {
+	var out []string
+	c.get(func(f *fakeClient) {
+		for _, r := range f.sent {
+			var parts []string
+			for _, p := range r.GetMessagePayload().GetMessageInfo() {
+				if m := p.GetMediaContent(); m != nil {
+					parts = append(parts, "image:"+m.GetMediaID())
+				} else {
+					parts = append(parts, p.GetMessageContent().GetContent())
+				}
+			}
+			out = append(out, strings.Join(parts, "+"))
+		}
+	})
+	return out
+}
+
+func isMedia(req *gmproto.SendMessageRequest) bool {
+	return req.GetMessagePayload().GetMessageInfo()[0].GetMediaContent() != nil
+}
+
+func assertImageLog(t *testing.T, h *harness, want ...string) {
+	t.Helper()
+	eventually(t, "send_image summary", func() bool { return strings.Contains(h.logs.String(), `send_image: `) })
+	logs := h.logs.String()
+	for _, w := range want {
+		if !strings.Contains(logs, w) {
+			t.Errorf("logs lack %s:\n%s", w, logs)
+		}
+	}
+	if strings.Count(logs, `send_image: `) != 1 {
+		t.Errorf("want exactly one summary line:\n%s", logs)
+	}
+	if strings.Contains(logs, "zzKeyval999") || strings.Contains(logs, "zzPixels") {
+		t.Error("logs contain the media key or the image")
+	}
+	assertNoText(t, h)
+}
+
+func TestSendImageSendsMediaThenCaption(t *testing.T) {
+	h, c, r := imageManager(t)
+	c.get(func(f *fakeClient) { f.autoEcho = true })
+	h.mgr.SendImage(groupID, report())
+	eventually(t, "image and caption", func() bool { return sentCount(c) == 2 })
+	if got := strings.Join(sentParts(c), ","); got != "image:media-1,zzBodyCaption" {
+		t.Fatalf("sent %s, want the image then the caption", got)
+	}
+	r.mu.Lock()
+	if r.calls[0] != "1080|<!doctype html><p>zzBodyHTML</p>" {
+		t.Errorf("render call %q", r.calls[0])
+	}
+	r.mu.Unlock()
+	c.get(func(f *fakeClient) {
+		if len(f.uploads) != 1 || string(f.uploads[0].data) != string(fakePNG) || f.uploads[0].name != "report.png" || f.uploads[0].mime != "image/png" {
+			t.Errorf("uploads: %+v", f.uploads)
+		}
+		req := f.sent[0]
+		p := req.GetMessagePayload()
+		if len(p.GetMessageInfo()) != 1 {
+			t.Errorf("the media message has %d parts, want 1 (the caption goes separately)", len(p.GetMessageInfo()))
+		}
+		m := p.GetMessageInfo()[0].GetMediaContent()
+		if m.GetMediaID() != "media-1" || string(m.GetDecryptionKey()) != "zzKeyval999" || m.GetMimeType() != "image/png" {
+			t.Errorf("media part: %v", m)
+		}
+		if req.GetConversationID() != groupID || p.GetConversationID() != groupID || p.GetParticipantID() != "1" {
+			t.Errorf("addressing: %v", req)
+		}
+		if req.GetTmpID() == "" || p.GetTmpID() != req.GetTmpID() || p.GetTmpID2() != req.GetTmpID() || req.GetSIMPayload().GetSIMNumber() != 1 {
+			t.Errorf("tmp ids or SIM: %v", req)
+		}
+	})
+	assertImageLog(t, h, `"outcome":"image"`, `"render_ms":`, fmt.Sprintf(`"png_bytes":%d`, len(fakePNG)), `"caption":"sent"`)
+}
+
+func TestSendImageWithoutCaptionOrFilename(t *testing.T) {
+	h, c, _ := imageManager(t)
+	c.get(func(f *fakeClient) { f.autoEcho = true })
+	img := report()
+	img.Caption, img.Filename = "", ""
+	h.mgr.SendImage(groupID, img)
+	assertImageLog(t, h, `"outcome":"image"`, `"caption":"none"`)
+	if got := strings.Join(sentParts(c), ","); got != "image:media-1" {
+		t.Errorf("sent %s", got)
+	}
+	c.get(func(f *fakeClient) {
+		if f.uploads[0].name != defaultImageName {
+			t.Errorf("file name %q", f.uploads[0].name)
+		}
+	})
+}
+
+// Anything failing before the phone accepted the image: the fallback texts go instead, in order.
+func TestSendImageFailuresSendFallback(t *testing.T) {
+	cases := []struct {
+		name    string
+		setup   func(c *fakeClient, r *fakeRenderer, img *Image)
+		sent    string // what reaches SendMessage
+		uploads int
+		reason  string
+	}{
+		{"render fails", func(_ *fakeClient, r *fakeRenderer, _ *Image) {
+			r.err = errors.New("the page's check failed: font missing")
+		},
+			"zzBodyFallback1,zzBodyFallback2", 0, "font missing"},
+		{"upload fails", func(c *fakeClient, _ *fakeRenderer, _ *Image) { c.uploadErr = errors.New("unexpected status code 500") },
+			"zzBodyFallback1,zzBodyFallback2", 1, "uploading"},
+		{"phone refuses the image", func(c *fakeClient, _ *fakeRenderer, _ *Image) {
+			c.sendResult = func(req *gmproto.SendMessageRequest) (gmproto.SendMessageResponse_Status, error) {
+				if isMedia(req) {
+					return gmproto.SendMessageResponse_FAILURE_3, nil
+				}
+				return gmproto.SendMessageResponse_SUCCESS, nil
+			}
+		}, "image:media-1,zzBodyFallback1,zzBodyFallback2", 1, "FAILURE_3"},
+		{"sending the image errors", func(c *fakeClient, _ *fakeRenderer, _ *Image) {
+			c.sendResult = func(req *gmproto.SendMessageRequest) (gmproto.SendMessageResponse_Status, error) {
+				if isMedia(req) {
+					return 0, errors.New("phone not responding")
+				}
+				return gmproto.SendMessageResponse_SUCCESS, nil
+			}
+		}, "image:media-1,zzBodyFallback1,zzBodyFallback2", 1, "phone not responding"},
+		{"no html", func(_ *fakeClient, _ *fakeRenderer, img *Image) { img.HTML = "" },
+			"zzBodyFallback1,zzBodyFallback2", 0, "no html"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, c, r := imageManager(t)
+			img := report()
+			c.get(func(f *fakeClient) {
+				f.autoEcho = true
+				tc.setup(f, r, &img)
+			})
+			h.mgr.SendImage(groupID, img)
+			assertImageLog(t, h, `"outcome":"fallback"`, `"fallback_sent":2`, `"fallback_texts":3`, tc.reason)
+			if got := strings.Join(sentParts(c), ","); got != tc.sent {
+				t.Errorf("sent %s, want %s (no caption)", got, tc.sent)
+			}
+			c.get(func(f *fakeClient) {
+				if len(f.uploads) != tc.uploads {
+					t.Errorf("%d uploads, want %d", len(f.uploads), tc.uploads)
+				}
+			})
+			if img.HTML == "" && r.callCount() != 0 {
+				t.Error("rendered a frame without html")
+			}
+		})
+	}
+}
+
+// The image went out; the caption failing is only logged: a fallback would repeat the report.
+func TestSendImageCaptionFailureSendsNoFallback(t *testing.T) {
+	h, c, _ := imageManager(t)
+	c.get(func(f *fakeClient) {
+		f.autoEcho = true
+		f.sendResult = func(req *gmproto.SendMessageRequest) (gmproto.SendMessageResponse_Status, error) {
+			if isMedia(req) {
+				return gmproto.SendMessageResponse_SUCCESS, nil
+			}
+			return gmproto.SendMessageResponse_FAILURE_2, nil
+		}
+	})
+	h.mgr.SendImage(groupID, report())
+	assertImageLog(t, h, `"outcome":"image"`, `"caption":"failed"`, "FAILURE_2")
+	if got := strings.Join(sentParts(c), ","); got != "image:media-1,zzBodyCaption" {
+		t.Errorf("sent %s, want the image and the caption only", got)
+	}
+}
+
+// The frame is one job in the conversation's queue: it waits for an earlier send, nothing else
+// gets between the image and its caption (not even during the render), the caption waits for
+// the image's echo, and a later send waits for the caption.
+func TestSendImageKeepsItsPlaceInTheQueue(t *testing.T) {
+	h, c, r := imageManager(t)
+	h.mgr.echoWait = 5 * time.Second
+	r.gate = make(chan struct{})
+	h.mgr.Send(groupID, "zzBody0")
+	h.mgr.SendImage(groupID, report())
+	h.mgr.Send(groupID, "zzBody9")
+	eventually(t, "first send", func() bool { return sentCount(c) == 1 })
+	time.Sleep(30 * time.Millisecond)
+	if r.callCount() != 0 {
+		t.Fatal("the render started before the earlier message was echoed")
+	}
+	echo(c, lastSent(c), "1001")
+	eventually(t, "render started", func() bool { return r.callCount() == 1 })
+	time.Sleep(30 * time.Millisecond)
+	if n := sentCount(c); n != 1 {
+		t.Fatalf("%d sent during the render: %v", n, sentParts(c))
+	}
+	close(r.gate)
+	eventually(t, "image sent", func() bool { return sentCount(c) == 2 })
+	time.Sleep(30 * time.Millisecond)
+	if n := sentCount(c); n != 2 {
+		t.Fatalf("the caption overtook the image's echo: %v", sentParts(c))
+	}
+	echo(c, lastSent(c), "1002")
+	eventually(t, "caption sent", func() bool { return sentCount(c) == 3 })
+	time.Sleep(30 * time.Millisecond)
+	if n := sentCount(c); n != 3 {
+		t.Fatalf("the later send overtook the caption: %v", sentParts(c))
+	}
+	echo(c, lastSent(c), "1003")
+	eventually(t, "later send", func() bool { return sentCount(c) == 4 })
+	if got := strings.Join(sentParts(c), ","); got != "zzBody0,image:media-1,zzBodyCaption,zzBody9" {
+		t.Errorf("order: %s", got)
+	}
+}
+
+// Fallback texts are sent inside the same job: a send queued during the render stays behind them.
+func TestSendImageFallbackKeepsItsPlaceInTheQueue(t *testing.T) {
+	h, c, r := imageManager(t)
+	c.get(func(f *fakeClient) { f.autoEcho = true })
+	r.gate = make(chan struct{})
+	r.err = errors.New("the page's check failed")
+	h.mgr.SendImage(groupID, report())
+	eventually(t, "render started", func() bool { return r.callCount() == 1 })
+	h.mgr.Send(groupID, "zzBody9")
+	close(r.gate)
+	eventually(t, "all sent", func() bool { return sentCount(c) == 3 })
+	if got := strings.Join(sentParts(c), ","); got != "zzBodyFallback1,zzBodyFallback2,zzBody9" {
+		t.Errorf("order: %s", got)
+	}
 }

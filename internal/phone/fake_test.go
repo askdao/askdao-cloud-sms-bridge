@@ -47,6 +47,17 @@ type fakeClient struct {
 	reactOK      bool
 	reactions    []*gmproto.SendReactionRequest
 	echoSeq      int
+
+	// sendResult, when set, overrides sendStatus and sendErr per request.
+	sendResult func(req *gmproto.SendMessageRequest) (gmproto.SendMessageResponse_Status, error)
+	uploads    []upload // UploadMedia calls
+	uploadErr  error
+}
+
+// upload is one UploadMedia call.
+type upload struct {
+	data       []byte
+	name, mime string
 }
 
 func (f *fakeClient) SetEventHandler(h libgm.EventHandler) {
@@ -152,6 +163,9 @@ func (f *fakeClient) SendMessage(ctx context.Context, req *gmproto.SendMessageRe
 	}
 	f.mu.Lock()
 	status, err, echo := f.sendStatus, f.sendErr, f.autoEcho
+	if f.sendResult != nil {
+		status, err = f.sendResult(req)
+	}
 	f.echoSeq++
 	id := fmt.Sprintf("9%03d", f.echoSeq)
 	f.mu.Unlock()
@@ -174,6 +188,19 @@ func (f *fakeClient) SendReaction(_ context.Context, req *gmproto.SendReactionRe
 	defer f.mu.Unlock()
 	f.reactions = append(f.reactions, req)
 	return &gmproto.SendReactionResponse{Success: f.reactOK}, nil
+}
+
+func (f *fakeClient) UploadMedia(data []byte, fileName, mime string) (*gmproto.MediaContent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.uploads = append(f.uploads, upload{data: data, name: fileName, mime: mime})
+	if f.uploadErr != nil {
+		return nil, f.uploadErr
+	}
+	return &gmproto.MediaContent{
+		Format: gmproto.MediaFormats_IMAGE_PNG, MediaID: fmt.Sprintf("media-%d", len(f.uploads)), MediaName: fileName,
+		Size: int64(len(data)), DecryptionKey: []byte("zzKeyval999"), MimeType: mime,
+	}, nil
 }
 
 func (f *fakeClient) emit(evt any) {

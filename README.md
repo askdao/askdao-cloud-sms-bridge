@@ -25,6 +25,11 @@ group members ──carrier RCS / MMS──▶ Android phone (Google Messages, t
   optimization for Google Messages turned off.
 - A Mac (the Mac mini) with Go 1.26 or newer. The service is a LaunchAgent, so the Mac must
   log in automatically after a reboot (System Settings → Users & Groups → Automatic login).
+- Google Chrome on that Mac, for `send_image` frames (see "Protocol"), at
+  `/Applications/Google Chrome.app` or wherever `BRIDGE_CHROME_PATH` points. The bridge starts
+  its own headless Chrome with a temporary profile for each picture; it never opens or changes
+  the profiles of a Chrome you use. Without Chrome, `send_image` frames go out as their text
+  fallback (the bridge logs a warning at start).
 
 ## Install on the Mac mini
 
@@ -184,7 +189,7 @@ the token:
 lsof -nP -iTCP:3003 -sTCP:LISTEN
 npx wscat -c ws://localhost:3003
 # then send: {"type":"auth","token":"<BRIDGE_TOKEN>"}
-# the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":""}
+# the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":"","features":["send_image"]}
 ```
 
 Only one conductor connection is kept (see "Protocol"), so a test connection like this one
@@ -208,7 +213,19 @@ launchctl kickstart -k gui/$(id -u)/com.askdao.sms-bridge  # restart
 
 On a clean stop the bridge saves the session first.
 
-To update: `git pull && go build -o bin/sms-bridge ./cmd/sms-bridge`, then restart.
+To update, pull, rebuild and restart, then check the logs:
+
+```bash
+cd ~/Services/askdao-cloud-sms-bridge
+git pull
+go build -o bin/sms-bridge ./cmd/sms-bridge
+launchctl kickstart -k gui/$(id -u)/com.askdao.sms-bridge
+./deploy/macos/setup.sh logs
+```
+
+The `.env` and the session file stay as they are; settings added by an update have defaults
+(see `.env.example`). A line `Google Chrome not found` in `logs/bridge.error.log` means pictures
+will go out as text: install Chrome, or set `BRIDGE_CHROME_PATH` in `.env` and restart.
 
 ## Logs
 
@@ -285,12 +302,14 @@ if the phone is reset or replaced).
 **Status**, right after a successful `auth` and again on every change:
 
 ```json
-{"type": "status", "status": "connected", "state": "phone_offline", "detail": "phone_not_responding"}
+{"type": "status", "status": "connected", "state": "phone_offline", "detail": "phone_not_responding", "features": ["send_image"]}
 ```
 
 `state` and `detail` are the values in "Status". `status` is always `"connected"`: it says
 this WebSocket link is up, which is how conductor already reads the iMessage bridge's
-status frame; the phone connection is in `state`.
+status frame; the phone connection is in `state`. `features` lists the optional frames this
+bridge accepts, always `["send_image"]`; a bridge whose status frame lacks it (an older
+version) only takes `send` and `react`.
 
 **Message**, a new message from someone else:
 
@@ -374,6 +393,49 @@ passed on as a direct one.
   same queue. Different `to` values do not wait for each other. If the phone does not
   answer at all, libgm gives up on a request after 60 seconds.
 - Failures are logged (without the text); nothing is reported back to conductor.
+
+**send_image**: a picture drawn from an HTML page, then a caption.
+
+```json
+{
+  "type": "send_image",
+  "to": "24",
+  "html": "<!doctype html>…",
+  "width": 1080,
+  "filename": "report-2026-01-01.png",
+  "caption": "Full version: https://example.com/r/abc",
+  "fallback": ["First part of the text version", "Second part"]
+}
+```
+
+- `to` as in `send`. A frame without `to` is ignored. A frame without `html` sends `fallback`
+  straight away; one with neither is ignored.
+- The frame is one job in the queue of its `to`, like `send`: it waits for what was queued
+  before it, nothing else gets between the picture and its caption, and later frames for the
+  same `to` wait until it is done.
+- Drawing: the bridge starts Google Chrome (`BRIDGE_CHROME_PATH`) headless with a new
+  temporary profile directory, a viewport `width` CSS pixels wide (default 1080, at most 4096)
+  and 800 high, device scale factor 1, and every network request blocked (`data:` URLs work,
+  so the page must carry everything inline). It loads `html`, waits for the page to load and
+  for `document.fonts.ready`, then, if the page defines a function `window.__renderCheck`,
+  waits for its result: a non-empty array of strings means the page is not fit to send, and
+  the strings are logged. Then it takes a PNG of the whole page, exactly `width` pixels wide
+  and as tall as the page (at least the 800-pixel viewport). One picture at a time, at most
+  30 seconds; Chrome is stopped and its profile directory deleted every time.
+- Sending: the PNG is uploaded (named `filename`, default `image.png`) and sent as a media
+  message. Once the phone has accepted it, `caption` goes as a separate text (none if empty),
+  after the picture's echo or 10 seconds, as between two `send` frames.
+- "Accepted" means what it means for `send`: the phone answered the send request with
+  success. If drawing, uploading or sending fails before that, each non-empty `fallback`
+  string goes as a text, in order, like `send` frames. If only the caption fails, that is
+  logged and nothing more is sent (the fallback would repeat the picture).
+- In MMS conversations the phone compresses the picture to fit the carrier's size limit, so
+  a tall page may lose sharpness there; RCS conversations get the PNG as it is.
+- Each frame ends with one summary line in the log: `send_image: image sent` (info) or
+  `send_image: image not sent, fallback texts sent instead` (warning, with the reason), with
+  `outcome` (`image` or `fallback`), `render_ms`, `png_bytes`, and `caption`
+  (`sent`, `failed`, `none`) or `fallback_sent` / `fallback_texts`. The single messages are
+  logged as for `send`. No HTML and no text is logged.
 
 ## License
 

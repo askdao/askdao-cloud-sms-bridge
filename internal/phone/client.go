@@ -1,6 +1,7 @@
 // [INPUT]: go.mau.fi/mautrix-gmessages/pkg/libgm Client and gmproto, go.mau.fi/util/exhttp
 // [OUTPUT]: Client (the libgm subset the bridge uses), NewClientFunc, NewLibgmClient
-// [POS]: internal/phone's seam to libgm; manager.go, pair.go and outbound.go only talk to Client, tests supply a fake
+// [POS]: internal/phone's seam to libgm; manager.go, pair.go and outbound.go (texts, reactions, media uploads)
+//        only talk to Client, tests supply a fake
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Package phone drives Google Messages through libgm on behalf of the paired Android phone:
@@ -36,6 +37,10 @@ type Client interface {
 	// arrives later, in the echoed message event carrying the same tmp id.
 	SendMessage(ctx context.Context, req *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
 	SendReaction(ctx context.Context, req *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error)
+	// UploadMedia encrypts data and uploads it to Google (not to the phone); the returned
+	// MediaContent goes into a SendMessage part. It takes no context: libgm's HTTP client
+	// timeouts bound it.
+	UploadMedia(data []byte, fileName, mime string) (*gmproto.MediaContent, error)
 }
 
 // NewClientFunc builds a Client around auth.

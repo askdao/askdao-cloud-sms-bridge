@@ -22,6 +22,7 @@ type fakeBackend struct {
 	mu     sync.Mutex
 	sends  []string // "to|text"
 	reacts []string // "to|message_id|reaction"
+	images []string // "to|" + the Image as JSON
 }
 
 func (b *fakeBackend) Send(to, text string) {
@@ -34,6 +35,19 @@ func (b *fakeBackend) React(to, messageID, reaction string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.reacts = append(b.reacts, to+"|"+messageID+"|"+reaction)
+}
+
+func (b *fakeBackend) SendImage(to string, img phone.Image) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	j, _ := json.Marshal(img)
+	b.images = append(b.images, to+"|"+string(j))
+}
+
+func (b *fakeBackend) imageCalls() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.images...)
 }
 
 func (b *fakeBackend) snapshot() ([]string, []string) {
@@ -134,17 +148,17 @@ func TestAuthThenStatusFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw != `{"type":"status","status":"connected","state":"phone_offline","detail":"connecting"}` {
+	if raw != `{"type":"status","status":"connected","state":"phone_offline","detail":"connecting","features":["send_image"]}` {
 		t.Errorf("first frame: %s", raw)
 	}
 	ts.srv.PublishStatus(phone.Status{State: phone.StateOK})
 	ts.srv.PublishStatus(phone.Status{State: phone.StateLoggedOut, Detail: phone.DetailPairRevoked})
 	_, raw, _ = read(t, c)
-	if raw != `{"type":"status","status":"connected","state":"ok","detail":""}` {
+	if raw != `{"type":"status","status":"connected","state":"ok","detail":"","features":["send_image"]}` {
 		t.Errorf("second frame: %s", raw)
 	}
 	_, raw, _ = read(t, c)
-	if raw != `{"type":"status","status":"connected","state":"logged_out","detail":"pair_revoked"}` {
+	if raw != `{"type":"status","status":"connected","state":"logged_out","detail":"pair_revoked","features":["send_image"]}` {
 		t.Errorf("third frame: %s", raw)
 	}
 }
@@ -250,6 +264,42 @@ func TestCommands(t *testing.T) {
 	if strings.Contains(ts.logs.String(), "zzBody") {
 		t.Error("logs contain message text")
 	}
+}
+
+func TestSendImageFrames(t *testing.T) {
+	ts := newTestServer(t)
+	c := authed(t, ts)
+	write(t, c, map[string]any{"type": "send_image", "to": "24", "html": "<p>zzBodyHTML</p>", "width": 1080,
+		"filename": "report.png", "caption": "zzBody caption", "fallback": []string{"zzBody one", "zzBody two"}})
+	write(t, c, map[string]any{"type": "send_image", "to": "24", "html": "<p>zzBodyHTML</p>"})                    // nothing optional
+	write(t, c, map[string]any{"type": "send_image", "to": "+15550000001", "fallback": []string{"zzBody three"}}) // no html: fallback only
+	write(t, c, map[string]any{"type": "send_image", "html": "<p>zzBodyHTML</p>", "fallback": []string{"x"}})     // no to: ignored
+	write(t, c, map[string]any{"type": "send_image", "to": "24"})                                                 // nothing to send: ignored
+	write(t, c, map[string]any{"type": "send", "to": "24", "text": "zzBody after"})
+	eventually(t, func() bool { s, _ := ts.backend.snapshot(); return len(s) == 1 })
+	want := []string{
+		`24|{"HTML":"\u003cp\u003ezzBodyHTML\u003c/p\u003e","Width":1080,"Filename":"report.png","Caption":"zzBody caption","Fallback":["zzBody one","zzBody two"]}`,
+		`24|{"HTML":"\u003cp\u003ezzBodyHTML\u003c/p\u003e","Width":0,"Filename":"","Caption":"","Fallback":null}`,
+		`+15550000001|{"HTML":"","Width":0,"Filename":"","Caption":"","Fallback":["zzBody three"]}`,
+	}
+	if got := ts.backend.imageCalls(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if n := strings.Count(ts.logs.String(), "ignored a send_image frame"); n != 2 {
+		t.Errorf("%d ignored frames logged, want 2", n)
+	}
+	if strings.Contains(ts.logs.String(), "zzBody") {
+		t.Error("logs contain message text or html")
+	}
+}
+
+// A send_image frame larger than the old 1 MiB limit is read, not a reason to drop the connection.
+func TestLargeSendImageFrame(t *testing.T) {
+	ts := newTestServer(t)
+	c := authed(t, ts)
+	html := "<p>" + strings.Repeat("x", 3<<20) + "</p>"
+	write(t, c, map[string]any{"type": "send_image", "to": "24", "html": html})
+	eventually(t, func() bool { return len(ts.backend.imageCalls()) == 1 })
 }
 
 // Only one conductor connection: a newly authenticated one replaces the previous.
