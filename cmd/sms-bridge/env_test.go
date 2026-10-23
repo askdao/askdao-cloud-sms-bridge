@@ -62,3 +62,14 @@ func TestValidateServe(t *testing.T) {
 		}
 	}
 }
+
+func TestChromePath(t *testing.T) {
+	t.Setenv("BRIDGE_CHROME_PATH", "")
+	if got := loadConfig().ChromePath; got != "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" {
+		t.Errorf("default %q", got)
+	}
+	t.Setenv("BRIDGE_CHROME_PATH", "/opt/example/chrome")
+	if got := loadConfig().ChromePath; got != "/opt/example/chrome" {
+		t.Errorf("set %q", got)
+	}
+}

@@ -40,6 +40,15 @@ install_service() {
         echo "    cd ${PROJECT_DIR} && ./bin/sms-bridge pair -cookies <cookie file>"
     fi
 
+    local chrome_path
+    chrome_path="$(grep -E '^BRIDGE_CHROME_PATH=' "${PROJECT_DIR}/.env" | tail -1 | cut -d= -f2- || true)"
+    chrome_path="${chrome_path#[\"\']}"; chrome_path="${chrome_path%[\"\']}"
+    chrome_path="${chrome_path:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+    if [[ ! -x "$chrome_path" ]]; then
+        echo "WARNING: no Google Chrome at ${chrome_path}. send_image frames will go out as text."
+        echo "    Install Google Chrome, or set BRIDGE_CHROME_PATH in .env."
+    fi
+
     mkdir -p "$LOG_DIR"
 
     echo "==> Generating launchd plist..."

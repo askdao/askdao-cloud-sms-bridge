@@ -1,7 +1,7 @@
 // [INPUT]: github.com/coder/websocket, frames.go, internal/phone Inbound and Status, a Backend (phone.Manager)
 // [OUTPUT]: Server (New, ServeHTTP, PublishStatus, Deliver), Backend
 // [POS]: internal/ws, the WebSocket server conductor connects to: shared-token auth, one authenticated
-//        connection at a time (the newest wins), status and message frames out, send / react frames in
+//        connection at a time (the newest wins), status and message frames out, send / react / send_image frames in
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Package ws serves the bridge's WebSocket protocol to conductor.
@@ -21,10 +21,11 @@ import (
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 )
 
-// Backend receives conductor's commands. Both calls must return without waiting for the phone.
+// Backend receives conductor's commands. Every call must return without waiting for the phone.
 type Backend interface {
 	Send(to, text string)
 	React(to, messageID, reaction string)
+	SendImage(to string, img phone.Image)
 }
 
 // Close codes. Anything other than 1000/1001 makes conductor's client wait 5 seconds before
@@ -35,7 +36,7 @@ const (
 )
 
 const (
-	readLimit    = 1 << 20 // send frames carry up to a few thousand characters of text
+	readLimit    = 8 << 20 // a send_image frame carries a whole HTML page, possibly with data: images
 	outBuffer    = 256
 	writeTimeout = 10 * time.Second
 )
@@ -223,6 +224,15 @@ func (s *Server) handle(data []byte) {
 			return
 		}
 		s.backend.React(cmd.To, cmd.MessageID, cmd.Reaction)
+	case "send_image":
+		if cmd.To == "" || (cmd.HTML == "" && len(cmd.Fallback) == 0) {
+			s.log.Warn().Str("to", cmd.To).Msg("ignored a send_image frame without to, or without both html and fallback")
+			return
+		}
+		// Without html the phone side sends the fallback texts straight away.
+		s.backend.SendImage(cmd.To, phone.Image{
+			HTML: cmd.HTML, Width: cmd.Width, Filename: cmd.Filename, Caption: cmd.Caption, Fallback: cmd.Fallback,
+		})
 	case "auth":
 		// already authenticated
 	default:

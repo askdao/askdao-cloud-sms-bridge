@@ -12,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/askdao/askdao-cloud-sms-bridge/internal/render"
 )
 
 // loadDotEnv sets KEY=VALUE lines from path into the environment without overriding variables
@@ -53,6 +55,7 @@ type config struct {
 	SessionFile string
 	Port        string // WebSocket port conductor connects to
 	Token       string // shared token conductor sends in its auth frame
+	ChromePath  string // the Google Chrome binary that renders send_image frames
 }
 
 func loadConfig() config {
@@ -60,6 +63,7 @@ func loadConfig() config {
 		SessionFile: envOr("BRIDGE_SESSION_FILE", "session.json"),
 		Port:        envOr("BRIDGE_PORT", "3003"),
 		Token:       os.Getenv("BRIDGE_TOKEN"),
+		ChromePath:  envOr("BRIDGE_CHROME_PATH", render.DefaultChromePath),
 	}
 }
 

@@ -1,6 +1,6 @@
 // [INPUT]: client.go Client/NewClientFunc, state.go Tracker, inbound.go inbox, outbound.go outbox,
 //          internal/session Save, libgm events and gmproto alerts / messages / conversations / settings
-// [OUTPUT]: Manager (NewManager, Run, Tracker, OnInbound; Send / React in outbound.go), ManagerConfig
+// [OUTPUT]: Manager (NewManager, Run, Tracker, OnInbound; Send / React / SendImage in outbound.go), ManagerConfig
 // [POS]: internal/phone's connection owner: connects with the saved session, turns libgm events into Tracker
 //        changes and admitted inbound messages, caches conversations and SIMs, saves the session,
 //        reconnects after non-credential failures, never takes the phone back
@@ -31,6 +31,7 @@ type ManagerConfig struct {
 	NewClient   NewClientFunc
 	Log         zerolog.Logger // the bridge's own logger
 	LibraryLog  zerolog.Logger // handed to libgm
+	Render      RenderFunc     // draws a send_image frame's HTML (render.Renderer.Render)
 }
 
 // Manager owns the libgm client for one paired phone.
@@ -40,6 +41,7 @@ type Manager struct {
 	newClient   NewClientFunc
 	log         zerolog.Logger
 	libLog      zerolog.Logger
+	render      RenderFunc
 	state       *Tracker
 
 	// test hooks
@@ -80,6 +82,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		newClient:     cfg.NewClient,
 		log:           cfg.Log,
 		libLog:        cfg.LibraryLog,
+		render:        cfg.Render,
 		state:         NewTracker(cfg.Log),
 		backoff:       reconnectBackoff,
 		activateAfter: 7 * time.Second,

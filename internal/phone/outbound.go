@@ -1,7 +1,7 @@
-// [INPUT]: client.go Client (SendMessage, SendReaction, GetOrCreateConversation), manager.go conversation cache and SIMs,
-//          inbound.go inbox (to recognise echoes), number.go NormalizeNumber
-// [OUTPUT]: Manager.Send, Manager.React; outbox (per-target serial queue)
-// [POS]: internal/phone's outbound side, called by the WebSocket server for send / react frames
+// [INPUT]: client.go Client (SendMessage, SendReaction, GetOrCreateConversation, UploadMedia), manager.go conversation
+//          cache, SIMs and RenderFunc, inbound.go inbox (to recognise echoes), number.go NormalizeNumber
+// [OUTPUT]: Manager.Send, Manager.React, Manager.SendImage; Image, RenderFunc; outbox (per-target serial queue)
+// [POS]: internal/phone's outbound side, called by the WebSocket server for send / react / send_image frames
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 package phone
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
@@ -25,12 +26,36 @@ var errNotConnected = errors.New("not connected to the phone")
 // likeEmoji is what conductor's "like" reaction becomes, in RCS and SMS/MMS conversations alike.
 const likeEmoji = "👍"
 
+// defaultImageName names the PNG when the frame gives no filename.
+const defaultImageName = "image.png"
+
+// RenderFunc draws a self-contained HTML page width CSS pixels wide and returns the PNG.
+type RenderFunc func(ctx context.Context, html string, width int) ([]byte, error)
+
+// Image is a send_image frame: HTML to draw and send as a picture, a caption sent after it as a
+// separate text, and the texts to send instead when the picture cannot be sent.
+type Image struct {
+	HTML     string
+	Width    int // CSS pixels; the renderer applies its default when 0
+	Filename string
+	Caption  string
+	Fallback []string
+}
+
 // Send queues text for to: a phone-local conversation id (digits) or a phone number starting
 // with "+". It returns at once. Everything queued for the same to goes out one at a time in
 // queue order; a message counts as done when the phone has echoed it back (the echo carries
 // the same tmp id) or after echoWait, or when sending failed.
 func (m *Manager) Send(to, text string) {
-	m.out.enqueue(to, func() { m.sendText(m.ctx, to, text) })
+	m.out.enqueue(to, func() { _ = m.sendText(m.ctx, to, text) })
+}
+
+// SendImage queues img for to in the same queue as Send, as one job, and returns at once: the
+// HTML is rendered to a PNG, uploaded and sent as a media message, then the caption (if any)
+// goes as a text. If anything fails before the phone accepted the media message, the fallback
+// texts go instead, one after the other. If only the caption fails, that is logged.
+func (m *Manager) SendImage(to string, img Image) {
+	m.out.enqueue(to, func() { m.sendImage(m.ctx, to, img) })
 }
 
 // React queues a reaction on messageID in the same queue as Send. Only "like" is supported,
@@ -43,22 +68,86 @@ func (m *Manager) React(to, messageID, reaction string) {
 	m.out.enqueue(to, func() { m.sendLike(m.ctx, to, messageID) })
 }
 
-func (m *Manager) sendText(ctx context.Context, to, text string) {
+func (m *Manager) sendText(ctx context.Context, to, text string) error {
 	log := m.log.With().Str("to", to).Int("chars", len([]rune(text))).Logger()
+	return m.sendParts(ctx, to, []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MessageContent{
+		MessageContent: &gmproto.MessageContent{Content: text},
+	}}}, log)
+}
+
+// sendImage is SendImage's job. Its last log line sums up the frame: outcome image or fallback,
+// render time and PNG size.
+func (m *Manager) sendImage(ctx context.Context, to string, img Image) {
+	log := m.log.With().Str("to", to).Logger()
+	var renderMS int64
+	var size int
+	err := func() error {
+		if img.HTML == "" {
+			return errors.New("the frame has no html")
+		}
+		cli := m.client()
+		if cli == nil {
+			return errNotConnected
+		}
+		start := time.Now()
+		png, err := m.render(ctx, img.HTML, img.Width)
+		renderMS = time.Since(start).Milliseconds()
+		if err != nil {
+			return fmt.Errorf("rendering: %w", err)
+		}
+		size = len(png)
+		name := img.Filename
+		if name == "" {
+			name = defaultImageName
+		}
+		media, err := cli.UploadMedia(png, name, "image/png")
+		if err != nil {
+			return fmt.Errorf("uploading: %w", err)
+		}
+		return m.sendParts(ctx, to, []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MediaContent{MediaContent: media}}},
+			log.With().Int("png_bytes", size).Logger())
+	}()
+	if err != nil {
+		sent := 0
+		for _, text := range img.Fallback {
+			if text != "" && m.sendText(ctx, to, text) == nil {
+				sent++
+			}
+		}
+		log.Warn().Err(err).Str("outcome", "fallback").Int64("render_ms", renderMS).Int("png_bytes", size).
+			Int("fallback_sent", sent).Int("fallback_texts", len(img.Fallback)).Msg("send_image: image not sent, fallback texts sent instead")
+		return
+	}
+	caption := "none"
+	if img.Caption != "" {
+		caption = "sent"
+		if m.sendText(ctx, to, img.Caption) != nil {
+			caption = "failed" // no fallback: it would repeat what the image already says
+		}
+	}
+	log.Info().Str("outcome", "image").Int64("render_ms", renderMS).Int("png_bytes", size).Str("caption", caption).
+		Msg("send_image: image sent")
+}
+
+// sendParts sends one message made of parts to `to`, then waits for the phone to echo it back
+// (at most echoWait) so that the next message cannot overtake it. It returns nil once the phone
+// has accepted the message, that is SendMessage answered SUCCESS: that is what "sent" means for
+// texts and images alike; a missing echo only delays the next message. Failures are logged here.
+func (m *Manager) sendParts(ctx context.Context, to string, parts []*gmproto.MessageInfo, log zerolog.Logger) error {
 	cli := m.client()
 	if cli == nil {
 		log.Warn().Err(errNotConnected).Msg("send failed")
-		return
+		return errNotConnected
 	}
 	convID, err := m.resolveTarget(ctx, cli, to)
 	if err != nil {
 		log.Warn().Err(err).Msg("send failed")
-		return
+		return err
 	}
 	conv, err := m.conversation(ctx, convID)
 	if err != nil {
 		log.Warn().Err(err).Str("conversation_id", convID).Msg("send failed")
-		return
+		return err
 	}
 	tmp := uuid.NewString()
 	log = log.With().Str("conversation_id", convID).Str("tmp_id", tmp).Logger()
@@ -71,20 +160,18 @@ func (m *Manager) sendText(ctx context.Context, to, text string) {
 			TmpID2:         tmp,
 			ConversationID: convID,
 			ParticipantID:  conv.GetDefaultOutgoingID(),
-			MessageInfo: []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MessageContent{
-				MessageContent: &gmproto.MessageContent{Content: text},
-			}}},
+			MessageInfo:    parts,
 		},
 		SIMPayload: m.simPayload(conv),
 		TmpID:      tmp,
 	})
 	if err != nil {
 		log.Warn().Err(err).Msg("send failed")
-		return
+		return err
 	}
 	if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 		log.Warn().Str("status", resp.GetStatus().String()).Msg("send failed: the phone refused it")
-		return
+		return fmt.Errorf("the phone refused the message (%s)", resp.GetStatus())
 	}
 	select {
 	case <-echo:
@@ -93,6 +180,7 @@ func (m *Manager) sendText(ctx context.Context, to, text string) {
 		log.Warn().Dur("waited", m.echoWait).Msg("sent, but the phone has not echoed it yet; sending the next one")
 	case <-ctx.Done():
 	}
+	return nil
 }
 
 func (m *Manager) sendLike(ctx context.Context, to, messageID string) {
