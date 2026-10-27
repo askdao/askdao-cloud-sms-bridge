@@ -189,7 +189,7 @@ the token:
 lsof -nP -iTCP:3003 -sTCP:LISTEN
 npx wscat -c ws://localhost:3003
 # then send: {"type":"auth","token":"<BRIDGE_TOKEN>"}
-# the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":"","features":["send_image"]}
+# the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":"","features":["send_image","seq_ack"]}
 ```
 
 Only one conductor connection is kept (see "Protocol"), so a test connection like this one
@@ -302,14 +302,15 @@ if the phone is reset or replaced).
 **Status**, right after a successful `auth` and again on every change:
 
 ```json
-{"type": "status", "status": "connected", "state": "phone_offline", "detail": "phone_not_responding", "features": ["send_image"]}
+{"type": "status", "status": "connected", "state": "phone_offline", "detail": "phone_not_responding", "features": ["send_image", "seq_ack"]}
 ```
 
 `state` and `detail` are the values in "Status". `status` is always `"connected"`: it says
 this WebSocket link is up, which is how conductor already reads the iMessage bridge's
-status frame; the phone connection is in `state`. `features` lists the optional frames this
-bridge accepts, always `["send_image"]`; a bridge whose status frame lacks it (an older
-version) only takes `send` and `react`.
+status frame; the phone connection is in `state`. `features` lists what this bridge
+supports, always `["send_image", "seq_ack"]`: `send_image` frames, and the delivery protocol
+under "Delivery". A bridge whose status frame lacks `send_image` (an older version) only takes
+`send` and `react`.
 
 **Message**, a new message from someone else:
 
@@ -436,6 +437,51 @@ passed on as a direct one.
   `outcome` (`image` or `fallback`), `render_ms`, `png_bytes`, and `caption`
   (`sent`, `failed`, `none`) or `fallback_sent` / `fallback_texts`. The single messages are
   logged as for `send`. No HTML and no text is logged.
+
+### Delivery (`seq_ack`)
+
+So that nothing is lost or sent twice when conductor redeploys or the bridge restarts.
+
+Outbound: `send`, `react` and `send_image` may carry three more fields, all together:
+`seq` (the letter's number in its conversation; conductor counts from 1 per conversation),
+`part` (which frame of the letter, from 0) and `last` (whether it is the letter's last frame).
+
+```json
+{"type": "send", "to": "24", "text": "Answer text", "seq": 7, "part": 0, "last": true}
+```
+
+- Within one `to`, a frame whose (`seq`, `part`) is not after one already received is a replay:
+  it is not sent again (logged as `skipped a replayed frame`).
+- When the last frame of a letter has been handled by the queue for its `to` (sent, or given up
+  on: a failure counts as handled, as before nothing else is reported), the bridge answers
+  ```json
+  {"type": "ack", "to": "24", "up_to_seq": 7}
+  ```
+  meaning every letter of that conversation up to 7 is done. A replayed last frame is
+  answered with the same ack again.
+- Progress is saved in `BRIDGE_STATE_FILE`, so replays are still recognised after a restart.
+  After reconnecting, conductor sends again what comes after the last acknowledged letter.
+- Frames without these fields are handled as before.
+
+Inbound: every message frame is also held in `BRIDGE_STATE_FILE` until conductor answers
+
+```json
+{"type": "received", "id": "101"}
+```
+
+A conductor that sends
+
+```json
+{"type": "hello", "features": ["received"]}
+```
+
+after `auth` gets every still-held message sent again, oldest first; conductor drops messages
+it already has by `id`. Held messages older than `BRIDGE_INBOUND_REPLAY_MINUTES` (default 30)
+are not sent again and are removed: an answer that late would no longer fit. A conductor that
+never sends `hello` gets no replays, as before.
+
+The state file holds the text of held messages: it is written with mode 0600 and kept out of
+git, like the session file.
 
 ## License
 

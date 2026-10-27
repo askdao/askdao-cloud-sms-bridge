@@ -1,6 +1,6 @@
 // [INPUT]: client.go Client (SendMessage, SendReaction, GetOrCreateConversation, UploadMedia), manager.go conversation
 //          cache, SIMs and RenderFunc, inbound.go inbox (to recognise echoes), number.go NormalizeNumber
-// [OUTPUT]: Manager.Send, Manager.React, Manager.SendImage; Image, RenderFunc; outbox (per-target serial queue)
+// [OUTPUT]: Manager.Send, Manager.React, Manager.SendImage, Manager.After; Image, RenderFunc; outbox (per-target serial queue)
 // [POS]: internal/phone's outbound side, called by the WebSocket server for send / react / send_image frames
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
@@ -66,6 +66,12 @@ func (m *Manager) React(to, messageID, reaction string) {
 		return
 	}
 	m.out.enqueue(to, func() { m.sendLike(m.ctx, to, messageID) })
+}
+
+// After queues fn for to behind everything already queued for it, and returns at once: fn runs
+// when those have been handled (sent, or given up on).
+func (m *Manager) After(to string, fn func()) {
+	m.out.enqueue(to, fn)
 }
 
 func (m *Manager) sendText(ctx context.Context, to, text string) error {

@@ -6,7 +6,8 @@ cmd/sms-bridge/ - the binary: `pair` (Google-account pairing) and `serve` (phone
 internal/session/ - cookie-file parsing and the session file (load, atomic 0600 save under libgm's cookie lock)
 internal/phone/ - libgm seam (Client), connection Manager, status Tracker (ok / phone_offline / browser_inactive / logged_out), pairing flow, inbound rules, per-target outbound queue (texts, reactions, pictures with fallback)
 internal/render/ - draws a send_image frame's HTML to a full-page PNG with headless Google Chrome
-internal/ws/ - WebSocket server for conductor: token auth, one connection (newest wins), status (with features) / message frames out, send / react / send_image in
+internal/delivery/ - seq_ack bookkeeping: outbound progress per conversation and held inbound messages, in one JSON state file
+internal/ws/ - WebSocket server for conductor: token auth, one connection (newest wins), status (with features) / message / ack frames out, send / react / send_image / hello / received in
 internal/logx/ - log line shaping: UTC timestamp first, info vs warn+ split, allowlisted fields for libgm
 deploy/macos/ - launchd plist template and setup.sh (install / uninstall / status / logs)
 </directory>

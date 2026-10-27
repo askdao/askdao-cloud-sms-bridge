@@ -44,6 +44,9 @@ func (b *fakeBackend) SendImage(to string, img phone.Image) {
 	b.images = append(b.images, to+"|"+string(j))
 }
 
+// After runs fn at once: the fake records every call synchronously, so nothing is pending.
+func (b *fakeBackend) After(to string, fn func()) { fn() }
+
 func (b *fakeBackend) imageCalls() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -83,7 +86,7 @@ type testServer struct {
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	ts := &testServer{backend: &fakeBackend{}, logs: &syncBuffer{}}
-	ts.srv = New(token, ts.backend, zerolog.New(ts.logs))
+	ts.srv = New(token, ts.backend, nil, zerolog.New(ts.logs))
 	ts.srv.PublishStatus(phone.Status{State: phone.StatePhoneOffline, Detail: phone.DetailConnecting})
 	hs := httptest.NewServer(ts.srv)
 	t.Cleanup(hs.Close)
@@ -148,17 +151,17 @@ func TestAuthThenStatusFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw != `{"type":"status","status":"connected","state":"phone_offline","detail":"connecting","features":["send_image"]}` {
+	if raw != `{"type":"status","status":"connected","state":"phone_offline","detail":"connecting","features":["send_image","seq_ack"]}` {
 		t.Errorf("first frame: %s", raw)
 	}
 	ts.srv.PublishStatus(phone.Status{State: phone.StateOK})
 	ts.srv.PublishStatus(phone.Status{State: phone.StateLoggedOut, Detail: phone.DetailPairRevoked})
 	_, raw, _ = read(t, c)
-	if raw != `{"type":"status","status":"connected","state":"ok","detail":"","features":["send_image"]}` {
+	if raw != `{"type":"status","status":"connected","state":"ok","detail":"","features":["send_image","seq_ack"]}` {
 		t.Errorf("second frame: %s", raw)
 	}
 	_, raw, _ = read(t, c)
-	if raw != `{"type":"status","status":"connected","state":"logged_out","detail":"pair_revoked","features":["send_image"]}` {
+	if raw != `{"type":"status","status":"connected","state":"logged_out","detail":"pair_revoked","features":["send_image","seq_ack"]}` {
 		t.Errorf("third frame: %s", raw)
 	}
 }
@@ -320,17 +323,62 @@ func TestNewestConnectionWins(t *testing.T) {
 	eventually(t, func() bool { s, _ := ts.backend.snapshot(); return len(s) == 1 })
 }
 
-func TestDeliverWithoutConductorIsDropped(t *testing.T) {
+// An inbound message that arrives with no conductor connected is held: not sent on a plain
+// connection, sent after a hello that lists received, and no more once conductor confirmed it.
+func TestDeliverWithoutConductorIsHeld(t *testing.T) {
 	ts := newTestServer(t)
 	ts.srv.Deliver(phone.Inbound{ID: "1", ChatID: "24", Sender: "+15550000001", Content: "zzBody"})
 	if !strings.Contains(ts.logs.String(), "no conductor connected") || strings.Contains(ts.logs.String(), "zzBody") {
 		t.Errorf("logs: %s", ts.logs.String())
 	}
-	c := authed(t, ts) // nothing queued from before the connection
+	c := authed(t, ts)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, _, err := c.Read(ctx); err == nil {
-		t.Error("a message dropped before the connection was delivered later")
+		t.Error("a held message was sent without a hello")
+	}
+	c = authed(t, ts)
+	write(t, c, map[string]any{"type": "hello", "features": []string{"received"}})
+	m, _, err := read(t, c)
+	if err != nil || m["type"] != "message" || m["id"] != "1" {
+		t.Fatalf("held message not replayed: %v %v", m, err)
+	}
+	write(t, c, map[string]string{"type": "received", "id": "1"})
+	write(t, c, map[string]any{"type": "hello", "features": []string{"received"}})
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	if _, _, err := c.Read(ctx2); err == nil {
+		t.Error("a confirmed message was replayed")
+	}
+}
+
+// Marked frames: the last frame of each letter is acknowledged once handled; a replayed frame
+// is not sent again and the letter is acknowledged again.
+func TestMarkedFramesAckAndSkipReplays(t *testing.T) {
+	ts := newTestServer(t)
+	c := authed(t, ts)
+	mk := func(text string, seq, part int, last bool) map[string]any {
+		return map[string]any{"type": "send", "to": "24", "text": text, "seq": seq, "part": part, "last": last}
+	}
+	expectAck := func(want float64) {
+		t.Helper()
+		m, _, err := read(t, c)
+		if err != nil || m["type"] != "ack" || m["to"] != "24" || m["up_to_seq"] != want {
+			t.Fatalf("want ack up_to_seq %v, got %v %v", want, m, err)
+		}
+	}
+	write(t, c, mk("a1", 1, 0, false))
+	write(t, c, mk("a2", 1, 1, true))
+	expectAck(1)
+	write(t, c, mk("a2", 1, 1, true)) // replay after a reconnect
+	expectAck(1)
+	write(t, c, mk("b", 2, 0, true))
+	expectAck(2)
+	write(t, c, map[string]any{"type": "send", "to": "24", "text": "unmarked"})
+	eventually(t, func() bool { s, _ := ts.backend.snapshot(); return len(s) == 4 })
+	sends, _ := ts.backend.snapshot()
+	if strings.Join(sends, ",") != "24|a1,24|a2,24|b,24|unmarked" {
+		t.Errorf("sends: %v", sends)
 	}
 }
 
