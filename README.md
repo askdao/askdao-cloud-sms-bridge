@@ -192,12 +192,41 @@ npx wscat -c ws://localhost:3003
 # the reply is the status frame, e.g. {"type":"status","status":"connected","state":"ok","detail":"","features":["send_image","seq_ack"]}
 ```
 
-Only one conductor connection is kept (see "Protocol"), so a test connection like this one
-replaces conductor's. Once conductor is connected, do not test this way: until conductor
-reconnects (about 5 seconds), new messages go to the test session and conductor never
-sees them.
+Only one conductor connection is kept (see "Protocol"): once conductor is connected, a test
+connection with `BRIDGE_TOKEN` is refused with `Another client is connected`. To watch a
+running bridge, set `BRIDGE_OBSERVER_TOKEN` in `.env` (restart once) and authenticate with
+that token instead: the observer gets every frame conductor gets, and any command it sends is
+answered with `{"type":"error","error":"read-only"}`.
 
 Give conductor `wss://sms-bridge.example.com` and the same token.
+
+## Register as an edge node
+
+Conductor watches the bridge through heartbeats: once registered, the bridge reports every
+minute what it can do and whether it is healthy, and conductor posts one Slack alert when the
+heartbeats stop for about three minutes (and one when they come back).
+
+1. An operator of conductor issues a one-time code (valid 24 hours) for this node, for
+   example named `macmini-sms` of kind `sms-bridge`.
+2. On the Mac mini, in the install directory, set `EDGE_CONDUCTOR_URL` in `.env` to
+   conductor's API address, then:
+
+   ```bash
+   ./bin/sms-bridge enroll <code>
+   launchctl kickstart -k gui/$(id -u)/com.askdao.sms-bridge
+   ```
+
+   `enroll` writes `edge-node.json` (`EDGE_IDENTITY_FILE`, mode 0600; it holds the node
+   token, never copy it into the repository). After the restart `logs/bridge.log` has a line
+   `edge heartbeat started`.
+
+Each heartbeat declares `channel:sms`, `feature:send_image` and `feature:seq_ack`, the commit
+the binary was built from and the host name, and a status: `ok`, or `degraded` with a detail
+(`phone <state>/<detail>` while the phone state is not `ok`, `conductor not connected`).
+Without the identity file the bridge runs as before, without heartbeats. If conductor stops
+accepting the token (401: revoked or enrolled again elsewhere), the heartbeat stops with an
+error line; get a new code and enroll again. A second process with the same identity file is
+refused (409) while the first one is alive.
 
 ## Start and stop
 
@@ -290,12 +319,18 @@ if the phone is reset or replaced).
   frame, within 10 seconds. A wrong token, any other first frame, or no frame in time gets
   `{"type": "error", "error": "Invalid token" | "Not authenticated"}` and a close with code
   1008.
-- One authenticated connection at a time: a newly authenticated connection replaces the
-  previous one, which is closed with code 4000 ("replaced by a newer connection"). The
-  newest wins because conductor sends queued frames right after `auth` without waiting for
-  a reply; refusing the newcomer would silently lose those frames. While two conductor
-  instances overlap (a redeploy), they take turns about every 5 seconds until the old one
-  stops.
+- One conductor connection at a time. When a newcomer authenticates with `BRIDGE_TOKEN`,
+  the bridge pings the current connection: if it answers within 5 seconds, the newcomer gets
+  `{"type": "error", "error": "Another client is connected"}` and a close with code 4009;
+  if it does not, it is closed with code 4000 ("stopped answering pings") and the newcomer
+  takes over. Frames the newcomer sent right after `auth` are kept and acted on once it takes
+  over. Frames a refused newcomer sent are dropped; conductor sends them again because they
+  were never acknowledged (`seq_ack`, below). While two conductor instances overlap (a
+  redeploy), the new one retries every 5 seconds until the old one has gone.
+- Observers authenticate with `BRIDGE_OBSERVER_TOKEN` (when set; at most 4 at a time). They
+  get the status frame and then every frame the conductor connection gets; any frame they
+  send is answered with `{"type": "error", "error": "read-only"}`. They never count as the
+  conductor connection.
 
 ### Bridge → conductor
 

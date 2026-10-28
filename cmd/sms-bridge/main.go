@@ -1,7 +1,8 @@
 // [INPUT]: env.go config, internal/logx loggers, internal/delivery Ledger, internal/session (cookies, session file), internal/phone (Pair, Manager),
-//          internal/render Renderer, internal/ws Server
-// [OUTPUT]: the sms-bridge binary: `sms-bridge pair -cookies <file>` and `sms-bridge serve`
-// [POS]: cmd/sms-bridge, the entry point launchd runs (serve: phone Manager + renderer + delivery ledger + WebSocket server) and the operator runs once (pair)
+//          internal/render Renderer, internal/ws Server, internal/edge (Enroll, Heartbeat)
+// [OUTPUT]: the sms-bridge binary: `sms-bridge pair -cookies <file>`, `sms-bridge enroll <code>` and `sms-bridge serve`
+// [POS]: cmd/sms-bridge, the entry point launchd runs (serve: phone Manager + renderer + delivery ledger + WebSocket server
+//        + edge heartbeat once enrolled) and the operator runs once (pair, enroll)
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Command sms-bridge relays an Android phone's Google Messages (SMS/RCS) to the AskDAO conductor.
@@ -16,10 +17,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/delivery"
+	"github.com/askdao/askdao-cloud-sms-bridge/internal/edge"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/logx"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/render"
@@ -29,6 +32,7 @@ import (
 
 const usage = `usage:
   sms-bridge pair -cookies <file>   pair with the phone through Google account cookies, write the session file
+  sms-bridge enroll <code>          register with conductor as an edge node (one-time code), write the identity file
   sms-bridge serve                  run the bridge with the saved session
 
 Settings come from the environment and from .env in the working directory (see .env.example).
@@ -48,6 +52,8 @@ func main() {
 	switch os.Args[1] {
 	case "pair":
 		err = runPair(cfg, os.Args[2:])
+	case "enroll":
+		err = runEnroll(cfg, os.Args[2:])
 	case "serve":
 		err = runServe(cfg)
 	default:
@@ -91,6 +97,63 @@ func runPair(cfg config, args []string) error {
 	return nil
 }
 
+func runEnroll(cfg config, args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return errors.New("enroll needs the one-time code: sms-bridge enroll <code>")
+	}
+	if cfg.EdgeURL == "" {
+		return errors.New("EDGE_CONDUCTOR_URL is empty; set conductor's API address in .env")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	id, err := edge.Enroll(ctx, &http.Client{}, cfg.EdgeURL, args[0], cfg.EdgeIdentity)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Enrolled as edge node %s (%s). Identity saved to %s. Restart the service to start the heartbeat.\n",
+		id.Name, id.Kind, cfg.EdgeIdentity)
+	return nil
+}
+
+// capabilities is what the heartbeat declares.
+var capabilities = []string{"channel:sms", "feature:send_image", "feature:seq_ack"}
+
+// buildVersion is the commit the binary was built from (go build embeds it in a git checkout).
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	rev, dirty := "", false
+	for _, st := range info.Settings {
+		switch st.Key {
+		case "vcs.revision":
+			rev = st.Value
+		case "vcs.modified":
+			dirty = st.Value == "true"
+		}
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if rev != "" && dirty {
+		rev += "+dirty"
+	}
+	return rev
+}
+
+// health is degraded while the phone is not ok or conductor is not connected.
+func health(tracker *phone.Tracker, srv *ws.Server) edge.Health {
+	st := tracker.Status()
+	switch {
+	case st.State != phone.StateOK:
+		return edge.Health{Status: "degraded", Detail: "phone " + string(st.State) + "/" + st.Detail}
+	case !srv.Connected():
+		return edge.Health{Status: "degraded", Detail: "conductor not connected"}
+	}
+	return edge.Health{Status: "ok"}
+}
+
 func runServe(cfg config) error {
 	if err := cfg.validateServe(); err != nil {
 		return err
@@ -118,7 +181,7 @@ func runServe(cfg config) error {
 		Render:      render.New(cfg.ChromePath).Render,
 	})
 	ledger := delivery.New(cfg.StateFile, cfg.ReplayWindow, log)
-	srv := ws.New(cfg.Token, mgr, ledger, log)
+	srv := ws.New(cfg.Token, cfg.ObserverToken, mgr, ledger, log)
 	mgr.OnInbound(srv.Deliver)
 	mgr.Tracker().Subscribe(srv.PublishStatus)
 	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}
@@ -129,6 +192,19 @@ func runServe(cfg config) error {
 			stop() // exit with an error so launchd restarts the service
 		}
 	}()
+	switch id, err := edge.ReadIdentity(cfg.EdgeIdentity); {
+	case errors.Is(err, edge.ErrNoIdentity):
+		log.Info().Msg("not enrolled as an edge node: no heartbeat (run `sms-bridge enroll <code>` once)")
+	case err != nil:
+		log.Error().Err(err).Str("file", cfg.EdgeIdentity).Msg("edge identity file unreadable: no heartbeat")
+	case cfg.EdgeURL == "":
+		log.Error().Msg("EDGE_CONDUCTOR_URL is empty: no heartbeat")
+	default:
+		host, _ := os.Hostname()
+		hb := edge.NewHeartbeat(&http.Client{}, cfg.EdgeURL, id, capabilities,
+			func() edge.Health { return health(mgr.Tracker(), srv) }, buildVersion(), host, log)
+		go hb.Run(ctx)
+	}
 	log.Info().Str("port", cfg.Port).Msg("starting; conductor connects over WebSocket")
 	mgr.Run(ctx)
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

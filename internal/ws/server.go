@@ -1,8 +1,9 @@
 // [INPUT]: github.com/coder/websocket, frames.go, internal/phone Inbound and Status, a Backend (phone.Manager),
 //          internal/delivery Ledger (seq_ack bookkeeping)
-// [OUTPUT]: Server (New, ServeHTTP, PublishStatus, Deliver), Backend
-// [POS]: internal/ws, the WebSocket server conductor connects to: shared-token auth, one authenticated
-//        connection at a time (the newest wins), status / message / ack frames out, send / react / send_image /
+// [OUTPUT]: Server (New, ServeHTTP, PublishStatus, Deliver, Connected), Backend
+// [POS]: internal/ws, the WebSocket server conductor connects to: shared-token auth, one conductor
+//        connection at a time (a newcomer is refused while the current one answers a ping), read-only
+//        observers on a second token, status / message / ack frames out, send / react / send_image /
 //        hello / received frames in
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
@@ -37,30 +38,45 @@ type Backend interface {
 // Close codes. Anything other than 1000/1001 makes conductor's client wait 5 seconds before
 // reconnecting instead of retrying at once.
 const (
-	closeReplaced websocket.StatusCode = 4000 // a newer authenticated connection took over
+	closeReplaced websocket.StatusCode = 4000 // the connection stopped answering pings and a newer one took over
 	closeSlow     websocket.StatusCode = 4001 // the outgoing frame buffer filled up
+	closeBusy     websocket.StatusCode = 4009 // another conductor connection is live
 )
 
 const (
 	readLimit    = 8 << 20 // a send_image frame carries a whole HTML page, possibly with data: images
 	outBuffer    = 256
 	writeTimeout = 10 * time.Second
+	maxObservers = 4
 )
 
-// Server is the WebSocket endpoint. It keeps one authenticated connection; a newly
-// authenticated one replaces the previous (closed with 4000), so during a conductor
-// redeploy the old and new instances may take turns until the old one stops.
+// Server is the WebSocket endpoint. It keeps one conductor connection: a newcomer with the
+// token is refused (4009) while the current one answers a ping, and takes over (the old one
+// closed with 4000) when it does not. Observers authenticate with the observer token, get
+// every frame the conductor connection gets and may not send commands.
 type Server struct {
-	token       string
-	backend     Backend
-	ledger      *delivery.Ledger
-	log         zerolog.Logger
-	authTimeout time.Duration
+	token         string
+	observerToken string
+	backend       Backend
+	ledger        *delivery.Ledger
+	log           zerolog.Logger
+	authTimeout   time.Duration
+	pingTimeout   time.Duration
 
-	mu     sync.Mutex
-	cur    *conn
-	status phone.Status
+	attachMu  sync.Mutex // one newcomer at a time checks the current connection
+	mu        sync.Mutex
+	cur       *conn
+	observers map[*conn]struct{}
+	status    phone.Status
 }
+
+type role int
+
+const (
+	refused role = iota
+	primary
+	observer
+)
 
 type conn struct {
 	ws   *websocket.Conn
@@ -68,13 +84,33 @@ type conn struct {
 	done chan struct{}
 }
 
-// New returns a Server. token must not be empty. ledger holds the seq_ack bookkeeping; nil keeps
-// it in memory with a 30-minute replay window.
-func New(token string, backend Backend, ledger *delivery.Ledger, log zerolog.Logger) *Server {
+// New returns a Server. token must not be empty; an empty observerToken allows no observers.
+// ledger holds the seq_ack bookkeeping; nil keeps it in memory with a 30-minute replay window.
+func New(token, observerToken string, backend Backend, ledger *delivery.Ledger, log zerolog.Logger) *Server {
 	if ledger == nil {
 		ledger = delivery.New("", 30*time.Minute, log)
 	}
-	return &Server{token: token, backend: backend, ledger: ledger, log: log, authTimeout: 10 * time.Second}
+	return &Server{
+		token: token, observerToken: observerToken, backend: backend, ledger: ledger, log: log,
+		authTimeout: 10 * time.Second, pingTimeout: 5 * time.Second, observers: map[*conn]struct{}{},
+	}
+}
+
+// Connected reports whether a conductor connection is attached.
+func (s *Server) Connected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur != nil
+}
+
+// broadcast sends frame to the conductor connection and every observer. Callers hold s.mu.
+func (s *Server) broadcast(frame []byte) {
+	if s.cur != nil {
+		s.push(s.cur, frame)
+	}
+	for o := range s.observers {
+		s.push(o, frame)
+	}
 }
 
 // PublishStatus records st and sends it to the connected conductor. It is a Tracker
@@ -83,9 +119,7 @@ func (s *Server) PublishStatus(st phone.Status) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = st
-	if s.cur != nil {
-		s.push(s.cur, encodeStatus(st))
-	}
+	s.broadcast(encodeStatus(st))
 }
 
 // Deliver holds an inbound message until conductor confirms it (received), and sends it to the
@@ -97,18 +131,15 @@ func (s *Server) Deliver(in phone.Inbound) {
 	defer s.mu.Unlock()
 	if s.cur == nil {
 		s.log.Warn().Str("message_id", in.ID).Str("conversation_id", in.ChatID).Msg("inbound held: no conductor connected")
-		return
 	}
-	s.push(s.cur, frame)
+	s.broadcast(frame)
 }
 
 // sendAck sends an ack frame to the connected conductor, if any.
 func (s *Server) sendAck(to string, upTo int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cur != nil {
-		s.push(s.cur, encodeAck(to, upTo))
-	}
+	s.broadcast(encodeAck(to, upTo))
 }
 
 // push queues a frame without blocking; a connection that stops reading is closed.
@@ -130,20 +161,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ws.SetReadLimit(readLimit)
 	ctx := r.Context()
-	if !s.authenticate(ctx, ws) {
+	who := s.authenticate(ctx, ws)
+	if who == refused {
 		return
 	}
 	c := &conn{ws: ws, out: make(chan []byte, outBuffer), done: make(chan struct{})}
 	defer close(c.done)
-	go s.writeLoop(c)
-	s.attach(c)
-	defer s.detach(c)
-	for {
-		_, data, err := ws.Read(ctx)
-		if err != nil {
-			s.log.Info().Int("close_code", int(websocket.CloseStatus(err))).Msg("conductor disconnected")
-			return
+	if who == observer {
+		s.serveObserver(ctx, c)
+		return
+	}
+	defer ws.CloseNow()
+	// Frames are read on their own goroutine from the start, so pings can be answered and nothing
+	// conductor sends right after auth is lost while attach decides.
+	frames := make(chan []byte, outBuffer)
+	go func() {
+		defer close(frames)
+		for {
+			_, data, err := ws.Read(ctx)
+			if err != nil {
+				s.log.Info().Int("close_code", int(websocket.CloseStatus(err))).Msg("conductor connection closed")
+				return
+			}
+			select {
+			case frames <- data:
+			case <-c.done:
+				return
+			}
 		}
+	}()
+	if !s.attach(ctx, c) {
+		return
+	}
+	go s.writeLoop(c)
+	defer s.detach(c)
+	for data := range frames {
 		if !s.isCurrent(c) {
 			return // replaced: nothing more from this connection is acted on
 		}
@@ -151,47 +203,98 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveObserver runs a read-only connection: it gets the current status and every frame after
+// it; any command is answered with a read-only error.
+func (s *Server) serveObserver(ctx context.Context, c *conn) {
+	s.mu.Lock()
+	if len(s.observers) >= maxObservers {
+		s.mu.Unlock()
+		s.refuse(ctx, c.ws, "Too many observers", closeBusy)
+		return
+	}
+	s.observers[c] = struct{}{}
+	s.push(c, encodeStatus(s.status))
+	s.mu.Unlock()
+	go s.writeLoop(c)
+	s.log.Info().Msg("observer connected")
+	defer func() {
+		s.mu.Lock()
+		delete(s.observers, c)
+		s.mu.Unlock()
+		s.log.Info().Msg("observer disconnected")
+	}()
+	for {
+		if _, _, err := c.ws.Read(ctx); err != nil {
+			return
+		}
+		s.mu.Lock()
+		s.push(c, encodeError("read-only"))
+		s.mu.Unlock()
+	}
+}
+
 // authenticate requires {"type":"auth","token":...} as the first frame within authTimeout.
-func (s *Server) authenticate(ctx context.Context, ws *websocket.Conn) bool {
+// The conductor token gives primary, the observer token (when set) gives observer.
+func (s *Server) authenticate(ctx context.Context, ws *websocket.Conn) role {
 	actx, cancel := context.WithTimeout(ctx, s.authTimeout)
 	defer cancel()
 	_, data, err := ws.Read(actx)
 	if err != nil {
 		s.log.Warn().Msg("connection closed: no auth frame in time")
 		ws.Close(websocket.StatusPolicyViolation, "authentication timeout")
-		return false
+		return refused
 	}
 	var cmd command
-	reason := ""
-	switch {
-	case json.Unmarshal(data, &cmd) != nil || cmd.Type != "auth":
-		reason = "Not authenticated"
-	case subtle.ConstantTimeCompare([]byte(cmd.Token), []byte(s.token)) != 1:
-		reason = "Invalid token"
+	if json.Unmarshal(data, &cmd) != nil || cmd.Type != "auth" {
+		s.refuse(ctx, ws, "Not authenticated", websocket.StatusPolicyViolation)
+		return refused
 	}
-	if reason == "" {
-		return true
+	if subtle.ConstantTimeCompare([]byte(cmd.Token), []byte(s.token)) == 1 {
+		return primary
 	}
-	s.log.Warn().Str("reason", reason).Msg("connection refused")
-	wctx, wcancel := context.WithTimeout(ctx, writeTimeout)
-	defer wcancel()
-	_ = ws.Write(wctx, websocket.MessageText, encodeError(reason))
-	ws.Close(websocket.StatusPolicyViolation, reason)
-	return false
+	if s.observerToken != "" && subtle.ConstantTimeCompare([]byte(cmd.Token), []byte(s.observerToken)) == 1 {
+		return observer
+	}
+	s.refuse(ctx, ws, "Invalid token", websocket.StatusPolicyViolation)
+	return refused
 }
 
-// attach makes c the connection and sends it the current status first.
-func (s *Server) attach(c *conn) {
+// refuse sends an error frame and closes with code.
+func (s *Server) refuse(ctx context.Context, ws *websocket.Conn, reason string, code websocket.StatusCode) {
+	s.log.Warn().Str("reason", reason).Msg("connection refused")
+	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	_ = ws.Write(wctx, websocket.MessageText, encodeError(reason))
+	ws.Close(code, reason)
+}
+
+// attach makes c the conductor connection and sends it the current status first. While the
+// current connection answers a ping within pingTimeout, c is refused instead (4009): during a
+// conductor redeploy the new instance waits until the old one has gone, and the letters it sent
+// meanwhile are replayed by conductor because they were never acknowledged.
+func (s *Server) attach(ctx context.Context, c *conn) bool {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
 	s.mu.Lock()
 	old := s.cur
+	s.mu.Unlock()
+	if old != nil {
+		pctx, cancel := context.WithTimeout(ctx, s.pingTimeout)
+		err := old.ws.Ping(pctx)
+		cancel()
+		if err == nil {
+			s.refuse(ctx, c.ws, "Another client is connected", closeBusy)
+			return false
+		}
+		s.log.Warn().Msg("the conductor connection stopped answering pings; a newer one takes over")
+		go old.ws.Close(closeReplaced, "stopped answering pings")
+	}
+	s.mu.Lock()
 	s.cur = c
 	s.push(c, encodeStatus(s.status))
 	s.mu.Unlock()
-	if old != nil {
-		s.log.Warn().Msg("a newer conductor connection replaced the previous one")
-		go old.ws.Close(closeReplaced, "replaced by a newer connection")
-	}
 	s.log.Info().Msg("conductor authenticated")
+	return true
 }
 
 func (s *Server) detach(c *conn) {

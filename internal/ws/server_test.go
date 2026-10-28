@@ -16,7 +16,10 @@ import (
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 )
 
-const token = "zzTokenForTests"
+const (
+	token         = "zzTokenForTests"
+	observerToken = "zzObserverForTests"
+)
 
 type fakeBackend struct {
 	mu     sync.Mutex
@@ -86,7 +89,8 @@ type testServer struct {
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	ts := &testServer{backend: &fakeBackend{}, logs: &syncBuffer{}}
-	ts.srv = New(token, ts.backend, nil, zerolog.New(ts.logs))
+	ts.srv = New(token, observerToken, ts.backend, nil, zerolog.New(ts.logs))
+	ts.srv.pingTimeout = 300 * time.Millisecond
 	ts.srv.PublishStatus(phone.Status{State: phone.StatePhoneOffline, Detail: phone.DetailConnecting})
 	hs := httptest.NewServer(ts.srv)
 	t.Cleanup(hs.Close)
@@ -305,22 +309,102 @@ func TestLargeSendImageFrame(t *testing.T) {
 	eventually(t, func() bool { return len(ts.backend.imageCalls()) == 1 })
 }
 
-// Only one conductor connection: a newly authenticated one replaces the previous.
-func TestNewestConnectionWins(t *testing.T) {
+// readAsync reads the next frame on its own goroutine, so the connection answers pings meanwhile.
+func readAsync(t *testing.T, c *websocket.Conn) <-chan map[string]any {
+	ch := make(chan map[string]any, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, b, err := c.Read(ctx)
+		if err != nil {
+			ch <- nil
+			return
+		}
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		ch <- m
+	}()
+	return ch
+}
+
+// A newcomer with the token is refused (4009) while the current connection answers pings.
+func TestLiveConnectionRefusesNewcomer(t *testing.T) {
 	ts := newTestServer(t)
 	a := authed(t, ts)
-	b := authed(t, ts)
-	_, _, err := read(t, a)
-	if websocket.CloseStatus(err) != closeReplaced {
-		t.Fatalf("first connection: close status %v, want %d", websocket.CloseStatus(err), closeReplaced)
+	next := readAsync(t, a)
+	b := dial(t, ts.url)
+	write(t, b, map[string]string{"type": "auth", "token": token})
+	m, _, err := read(t, b)
+	if err != nil || m["type"] != "error" || m["error"] != "Another client is connected" {
+		t.Fatalf("newcomer: got %v %v", m, err)
+	}
+	if _, _, err = read(t, b); websocket.CloseStatus(err) != closeBusy {
+		t.Fatalf("newcomer close status %v, want %d", websocket.CloseStatus(err), closeBusy)
+	}
+	if !ts.srv.Connected() {
+		t.Fatal("the live connection was dropped")
 	}
 	ts.srv.Deliver(phone.Inbound{ID: "1", ChatID: "24", Sender: "+15550000001", Content: "x"})
-	m, _, err := read(t, b)
-	if err != nil || m["type"] != "message" {
-		t.Fatalf("second connection should get the message: %v %v", m, err)
+	if got := <-next; got == nil || got["type"] != "message" {
+		t.Fatalf("the live connection should keep getting messages: %v", got)
 	}
-	write(t, b, map[string]string{"type": "send", "to": "24", "text": "from b"})
+	write(t, a, map[string]string{"type": "send", "to": "24", "text": "from a"})
 	eventually(t, func() bool { s, _ := ts.backend.snapshot(); return len(s) == 1 })
+}
+
+// A connection that stops answering pings is closed with 4000 when a newcomer arrives, and the
+// newcomer's frames sent right after auth are acted on.
+func TestSilentConnectionIsReplaced(t *testing.T) {
+	ts := newTestServer(t)
+	a := authed(t, ts) // a is not read from any more, so it answers no ping
+	b := dial(t, ts.url)
+	write(t, b, map[string]string{"type": "auth", "token": token})
+	write(t, b, map[string]string{"type": "send", "to": "24", "text": "right after auth"})
+	m, _, err := read(t, b)
+	if err != nil || m["type"] != "status" {
+		t.Fatalf("newcomer should get the status frame: %v %v", m, err)
+	}
+	eventually(t, func() bool { s, _ := ts.backend.snapshot(); return len(s) == 1 })
+	if _, _, err := read(t, a); websocket.CloseStatus(err) != closeReplaced {
+		t.Fatalf("silent connection: close status %v, want %d", websocket.CloseStatus(err), closeReplaced)
+	}
+}
+
+// Observers get the status and every frame, may not send commands and do not block conductor.
+func TestObserver(t *testing.T) {
+	ts := newTestServer(t)
+	o := dial(t, ts.url)
+	write(t, o, map[string]string{"type": "auth", "token": observerToken})
+	if m, _, err := read(t, o); err != nil || m["type"] != "status" {
+		t.Fatalf("observer should get the status frame: %v %v", m, err)
+	}
+	if ts.srv.Connected() {
+		t.Fatal("an observer is not the conductor connection")
+	}
+	a := authed(t, ts)
+	ts.srv.Deliver(phone.Inbound{ID: "1", ChatID: "24", Sender: "+15550000001", Content: "x"})
+	for name, c := range map[string]*websocket.Conn{"conductor": a, "observer": o} {
+		if m, _, err := read(t, c); err != nil || m["type"] != "message" {
+			t.Fatalf("%s should get the message: %v %v", name, m, err)
+		}
+	}
+	write(t, o, map[string]string{"type": "send", "to": "24", "text": "zzBody"})
+	if m, _, err := read(t, o); err != nil || m["type"] != "error" || m["error"] != "read-only" {
+		t.Fatalf("observer command: %v %v", m, err)
+	}
+	if s, _ := ts.backend.snapshot(); len(s) != 0 {
+		t.Error("an observer's command was acted on")
+	}
+}
+
+func TestObserverNeedsItsToken(t *testing.T) {
+	ts := newTestServer(t)
+	ts.srv.observerToken = ""
+	c := dial(t, ts.url)
+	write(t, c, map[string]string{"type": "auth", "token": ""})
+	if m, _, err := read(t, c); err != nil || m["error"] != "Invalid token" {
+		t.Fatalf("an empty observer token must allow nobody: %v %v", m, err)
+	}
 }
 
 // An inbound message that arrives with no conductor connected is held: not sent on a plain

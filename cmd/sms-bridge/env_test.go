@@ -73,3 +73,14 @@ func TestChromePath(t *testing.T) {
 		t.Errorf("set %q", got)
 	}
 }
+
+func TestObserverTokenMustDiffer(t *testing.T) {
+	c := config{SessionFile: "session.json", Port: "3003", Token: "zzTok", ObserverToken: "zzTok"}
+	if err := c.validateServe(); err == nil || !strings.Contains(err.Error(), "BRIDGE_OBSERVER_TOKEN") {
+		t.Errorf("same token: %v", err)
+	}
+	c.ObserverToken = "zzOther"
+	if err := c.validateServe(); err != nil {
+		t.Errorf("different token: %v", err)
+	}
+}
