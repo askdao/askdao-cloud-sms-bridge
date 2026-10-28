@@ -7,7 +7,7 @@ state.go: Tracker deriving ok / phone_offline / browser_inactive / logged_out wi
 manager.go: Manager, connects with the saved session, maps libgm events to the Tracker and the inbound worker, caches conversations and SIMs, saves the session, reconnects after non-credential failures
 pair.go: Pair, the Google-account pairing flow that writes the session file
 inbound.go: Inbound and the inbox rules deciding which message events are new messages from someone else (memory only, run in libgm's callback); strips the iPhone "Replied to a message:" line, drops iPhone reactions sent as text (tapback_fallback)
-outbound.go: Manager.Send / React / SendImage through a per-target serial queue that waits for the phone's echo; SendImage is one job (render, upload, picture, caption, or fallback texts); number targets resolved to one-to-one conversations
+outbound.go: Manager.Send / React / SendImage / After (run a callback once the target's queue reaches it) through a per-target serial queue that waits for the phone's echo; SendImage is one job (render, upload, picture, caption, or fallback texts); number targets resolved to one-to-one conversations
 number.go: NormalizeNumber, the E.164 rule for senders and number targets
 fake_test.go: fakeClient / fakeFactory (no network, uploads recorded, per-request send results) and test helpers
 state_test.go: status transitions and notifications

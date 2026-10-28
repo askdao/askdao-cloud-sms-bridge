@@ -1,7 +1,9 @@
-// [INPUT]: github.com/coder/websocket, frames.go, internal/phone Inbound and Status, a Backend (phone.Manager)
+// [INPUT]: github.com/coder/websocket, frames.go, internal/phone Inbound and Status, a Backend (phone.Manager),
+//          internal/delivery Ledger (seq_ack bookkeeping)
 // [OUTPUT]: Server (New, ServeHTTP, PublishStatus, Deliver), Backend
 // [POS]: internal/ws, the WebSocket server conductor connects to: shared-token auth, one authenticated
-//        connection at a time (the newest wins), status and message frames out, send / react / send_image frames in
+//        connection at a time (the newest wins), status / message / ack frames out, send / react / send_image /
+//        hello / received frames in
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Package ws serves the bridge's WebSocket protocol to conductor.
@@ -12,20 +14,24 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
+	"github.com/askdao/askdao-cloud-sms-bridge/internal/delivery"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 )
 
 // Backend receives conductor's commands. Every call must return without waiting for the phone.
+// After runs fn once everything queued for to so far has been handled.
 type Backend interface {
 	Send(to, text string)
 	React(to, messageID, reaction string)
 	SendImage(to string, img phone.Image)
+	After(to string, fn func())
 }
 
 // Close codes. Anything other than 1000/1001 makes conductor's client wait 5 seconds before
@@ -47,6 +53,7 @@ const (
 type Server struct {
 	token       string
 	backend     Backend
+	ledger      *delivery.Ledger
 	log         zerolog.Logger
 	authTimeout time.Duration
 
@@ -61,9 +68,13 @@ type conn struct {
 	done chan struct{}
 }
 
-// New returns a Server. token must not be empty.
-func New(token string, backend Backend, log zerolog.Logger) *Server {
-	return &Server{token: token, backend: backend, log: log, authTimeout: 10 * time.Second}
+// New returns a Server. token must not be empty. ledger holds the seq_ack bookkeeping; nil keeps
+// it in memory with a 30-minute replay window.
+func New(token string, backend Backend, ledger *delivery.Ledger, log zerolog.Logger) *Server {
+	if ledger == nil {
+		ledger = delivery.New("", 30*time.Minute, log)
+	}
+	return &Server{token: token, backend: backend, ledger: ledger, log: log, authTimeout: 10 * time.Second}
 }
 
 // PublishStatus records st and sends it to the connected conductor. It is a Tracker
@@ -77,16 +88,27 @@ func (s *Server) PublishStatus(st phone.Status) {
 	}
 }
 
-// Deliver sends an inbound message to the connected conductor, or drops it (logged) when
-// none is connected.
+// Deliver holds an inbound message until conductor confirms it (received), and sends it to the
+// connected conductor. With none connected it stays held, for a conductor that says hello.
 func (s *Server) Deliver(in phone.Inbound) {
+	frame := encodeMessage(in)
+	s.ledger.Hold(in.ID, frame)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cur == nil {
-		s.log.Warn().Str("message_id", in.ID).Str("conversation_id", in.ChatID).Msg("inbound dropped: no conductor connected")
+		s.log.Warn().Str("message_id", in.ID).Str("conversation_id", in.ChatID).Msg("inbound held: no conductor connected")
 		return
 	}
-	s.push(s.cur, encodeMessage(in))
+	s.push(s.cur, frame)
+}
+
+// sendAck sends an ack frame to the connected conductor, if any.
+func (s *Server) sendAck(to string, upTo int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur != nil {
+		s.push(s.cur, encodeAck(to, upTo))
+	}
 }
 
 // push queues a frame without blocking; a connection that stops reading is closed.
@@ -125,7 +147,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !s.isCurrent(c) {
 			return // replaced: nothing more from this connection is acted on
 		}
-		s.handle(data)
+		s.handle(c, data)
 	}
 }
 
@@ -204,13 +226,62 @@ func (s *Server) writeLoop(c *conn) {
 }
 
 // handle acts on one frame from the authenticated conductor. Frames are acted on in order;
-// Backend calls return at once, so a slow phone never stalls this loop.
-func (s *Server) handle(data []byte) {
+// Backend calls return at once, so a slow phone never stalls this loop. A frame with a delivery
+// mark that this conversation has already seen is skipped (re-acknowledged when it is a letter's
+// last frame); otherwise, once the phone queue has handled it, its progress is saved and the
+// letter's last frame is acknowledged.
+func (s *Server) handle(c *conn, data []byte) {
 	var cmd command
 	if err := json.Unmarshal(data, &cmd); err != nil {
 		s.log.Warn().Msg("ignored a frame that is not JSON")
 		return
 	}
+	switch cmd.Type {
+	case "hello":
+		if slices.Contains(cmd.Features, "received") {
+			held := s.ledger.Pending()
+			if len(held) > 0 {
+				s.log.Info().Int("messages", len(held)).Msg("replaying held inbound messages")
+			}
+			// Blocking sends on a goroutine: the replay may be longer than the frame buffer.
+			go func() {
+				for _, f := range held {
+					select {
+					case c.out <- f:
+					case <-c.done:
+						return
+					}
+				}
+			}()
+		}
+		return
+	case "received":
+		if cmd.ID != "" {
+			s.ledger.Release(cmd.ID)
+		}
+		return
+	}
+	mark, marked := cmd.mark()
+	marked = marked && cmd.To != "" && (cmd.Type == "send" || cmd.Type == "react" || cmd.Type == "send_image")
+	if marked && !s.ledger.Accept(cmd.To, mark) {
+		s.log.Info().Str("to", cmd.To).Int64("seq", mark.Seq).Int64("part", mark.Part).Msg("skipped a replayed frame")
+		if upTo, ok := s.ledger.AckedUpTo(cmd.To); ok && mark.Last {
+			s.sendAck(cmd.To, upTo)
+		}
+		return
+	}
+	s.dispatch(cmd)
+	if marked {
+		to := cmd.To
+		s.backend.After(to, func() {
+			if upTo, ok := s.ledger.Done(to, mark); ok {
+				s.sendAck(to, upTo)
+			}
+		})
+	}
+}
+
+func (s *Server) dispatch(cmd command) {
 	switch cmd.Type {
 	case "send":
 		if cmd.To == "" || cmd.Text == "" {

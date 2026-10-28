@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/render"
 )
@@ -56,6 +57,9 @@ type config struct {
 	Port        string // WebSocket port conductor connects to
 	Token       string // shared token conductor sends in its auth frame
 	ChromePath  string // the Google Chrome binary that renders send_image frames
+	StateFile   string // the seq_ack delivery state (outbound progress, held inbound messages)
+	// how long held inbound messages are sent again to a reconnecting conductor
+	ReplayWindow time.Duration
 }
 
 func loadConfig() config {
@@ -64,13 +68,32 @@ func loadConfig() config {
 		Port:        envOr("BRIDGE_PORT", "3003"),
 		Token:       os.Getenv("BRIDGE_TOKEN"),
 		ChromePath:  envOr("BRIDGE_CHROME_PATH", render.DefaultChromePath),
+		StateFile:   envOr("BRIDGE_STATE_FILE", "delivery.json"),
+		// a value that is not a whole number of minutes falls back to 30 (validateServe reports it)
+		ReplayWindow: time.Duration(envInt("BRIDGE_INBOUND_REPLAY_MINUTES", 30)) * time.Minute,
 	}
+}
+
+// envInt reads a non-negative whole number; unset gives def, anything else gives -1.
+func envInt(key string, def int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // validateServe checks the settings serve needs; pair needs none of them.
 func (c config) validateServe() error {
 	if c.Token == "" {
 		return errors.New("BRIDGE_TOKEN is empty; set it in .env (conductor sends the same token)")
+	}
+	if c.ReplayWindow < 0 {
+		return errors.New("BRIDGE_INBOUND_REPLAY_MINUTES must be a whole number of minutes")
 	}
 	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("BRIDGE_PORT must be a port number, got %q", c.Port)

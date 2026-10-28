@@ -1,7 +1,7 @@
-// [INPUT]: env.go config, internal/logx loggers, internal/session (cookies, session file), internal/phone (Pair, Manager),
+// [INPUT]: env.go config, internal/logx loggers, internal/delivery Ledger, internal/session (cookies, session file), internal/phone (Pair, Manager),
 //          internal/render Renderer, internal/ws Server
 // [OUTPUT]: the sms-bridge binary: `sms-bridge pair -cookies <file>` and `sms-bridge serve`
-// [POS]: cmd/sms-bridge, the entry point launchd runs (serve: phone Manager + renderer + WebSocket server) and the operator runs once (pair)
+// [POS]: cmd/sms-bridge, the entry point launchd runs (serve: phone Manager + renderer + delivery ledger + WebSocket server) and the operator runs once (pair)
 // [PROTOCOL]: Update this header on change, then check CLAUDE.md
 
 // Command sms-bridge relays an Android phone's Google Messages (SMS/RCS) to the AskDAO conductor.
@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/askdao/askdao-cloud-sms-bridge/internal/delivery"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/logx"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/phone"
 	"github.com/askdao/askdao-cloud-sms-bridge/internal/render"
@@ -116,7 +117,8 @@ func runServe(cfg config) error {
 		LibraryLog:  logx.Library(os.Stdout, os.Stderr),
 		Render:      render.New(cfg.ChromePath).Render,
 	})
-	srv := ws.New(cfg.Token, mgr, log)
+	ledger := delivery.New(cfg.StateFile, cfg.ReplayWindow, log)
+	srv := ws.New(cfg.Token, mgr, ledger, log)
 	mgr.OnInbound(srv.Deliver)
 	mgr.Tracker().Subscribe(srv.PublishStatus)
 	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}

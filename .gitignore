@@ -1,6 +1,7 @@
 # Secrets and live logins: never commit
 .env
 session.json*
+delivery.json*
 /cookies.txt
 /cookies.json
 
