@@ -56,19 +56,26 @@ type config struct {
 	SessionFile string
 	Port        string // WebSocket port conductor connects to
 	Token       string // shared token conductor sends in its auth frame
-	ChromePath  string // the Google Chrome binary that renders send_image frames
-	StateFile   string // the seq_ack delivery state (outbound progress, held inbound messages)
+	// read-only token for tests and watching; empty allows no observers
+	ObserverToken string
+	EdgeURL       string // conductor's API address for edge enrollment and heartbeats
+	EdgeIdentity  string // the edge node identity file written by `sms-bridge enroll`
+	ChromePath    string // the Google Chrome binary that renders send_image frames
+	StateFile     string // the seq_ack delivery state (outbound progress, held inbound messages)
 	// how long held inbound messages are sent again to a reconnecting conductor
 	ReplayWindow time.Duration
 }
 
 func loadConfig() config {
 	return config{
-		SessionFile: envOr("BRIDGE_SESSION_FILE", "session.json"),
-		Port:        envOr("BRIDGE_PORT", "3003"),
-		Token:       os.Getenv("BRIDGE_TOKEN"),
-		ChromePath:  envOr("BRIDGE_CHROME_PATH", render.DefaultChromePath),
-		StateFile:   envOr("BRIDGE_STATE_FILE", "delivery.json"),
+		SessionFile:   envOr("BRIDGE_SESSION_FILE", "session.json"),
+		Port:          envOr("BRIDGE_PORT", "3003"),
+		Token:         os.Getenv("BRIDGE_TOKEN"),
+		ObserverToken: os.Getenv("BRIDGE_OBSERVER_TOKEN"),
+		EdgeURL:       os.Getenv("EDGE_CONDUCTOR_URL"),
+		EdgeIdentity:  envOr("EDGE_IDENTITY_FILE", "edge-node.json"),
+		ChromePath:    envOr("BRIDGE_CHROME_PATH", render.DefaultChromePath),
+		StateFile:     envOr("BRIDGE_STATE_FILE", "delivery.json"),
 		// a value that is not a whole number of minutes falls back to 30 (validateServe reports it)
 		ReplayWindow: time.Duration(envInt("BRIDGE_INBOUND_REPLAY_MINUTES", 30)) * time.Minute,
 	}
@@ -91,6 +98,9 @@ func envInt(key string, def int) int {
 func (c config) validateServe() error {
 	if c.Token == "" {
 		return errors.New("BRIDGE_TOKEN is empty; set it in .env (conductor sends the same token)")
+	}
+	if c.ObserverToken != "" && c.ObserverToken == c.Token {
+		return errors.New("BRIDGE_OBSERVER_TOKEN must differ from BRIDGE_TOKEN")
 	}
 	if c.ReplayWindow < 0 {
 		return errors.New("BRIDGE_INBOUND_REPLAY_MINUTES must be a whole number of minutes")

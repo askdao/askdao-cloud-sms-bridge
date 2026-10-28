@@ -2,6 +2,7 @@
 .env
 session.json*
 delivery.json*
+edge-node.json*
 /cookies.txt
 /cookies.json
 
